@@ -21,7 +21,8 @@ import type {} from '@deepseek-ai/dsh-attachment'
 // than relying on adapter.ts's import of the same package.
 import type {} from '@deepseek-ai/dsh-llm'
 import { QoderCatalog } from './catalog.ts'
-import { createQoderAdapter } from './adapter.ts'
+import { loadQoderRoster, saveQoderRoster } from './catalog-store.ts'
+import { createQoderAdapter, type QoderContextWindowMode } from './adapter.ts'
 import { createQoderShim } from './shim.ts'
 import { QODER_PROVIDER } from './adapter.ts'
 import { registerQoderRoutes } from './web-status.ts'
@@ -30,9 +31,21 @@ import { clearQoderCliCache, fetchQoderModels, qoderStatus, type QoderOptions, t
 import { QODER_REASONING_EFFORTS, QODER_THINKING_MODES } from './qoder.ts'
 import { QODER_CONNECT_VERSION } from './version.ts'
 
-export { QODER_PROVIDER, QODER_STREAM_IDLE_TIMEOUT_MS, createQoderAdapter, type QoderAdapter } from './adapter.ts'
-export { QoderCatalog, type QoderCatalogEntry } from './catalog.ts'
+export { QODER_PROVIDER, QODER_STREAM_IDLE_TIMEOUT_MS, createQoderAdapter, type QoderAdapter, type QoderContextWindowMode } from './adapter.ts'
+export { QoderCatalog, type QoderCatalogEntry, type QoderRosterSource } from './catalog.ts'
+export {
+  loadQoderRoster,
+  qoderRosterPath,
+  saveQoderRoster,
+  type QoderSavedModel,
+  type QoderSavedRoster,
+} from './catalog-store.ts'
 export { createQoderShim, type QoderShim } from './shim.ts'
+export {
+  disposeImageAttachments,
+  materializeImageAttachments,
+  type QoderImageMaterial,
+} from './images.ts'
 export {
   QODER_MODELS,
   QODER_DEFAULT_MODEL,
@@ -76,12 +89,16 @@ export {
 } from './model-catalog.ts'
 export { registerQoderRoutes } from './web-status.ts'
 export {
+  parseQoderConfigPatch,
   parseReasoningPatch,
   qoderConfigHandler,
+  qoderWebContextWindow,
   qoderWebReasoning,
+  qoderWebStatus,
   registerQoderStatusRoute,
   QODER_CONFIG_PATH,
   QODER_STATUS_PATH,
+  type QoderWebContextWindow,
   type QoderWebReasoning,
   type QoderWebStatus,
 } from './web-status.ts'
@@ -145,6 +162,25 @@ export interface Config {
    * flag; the CLI treats it as implying thinking enabled.
    */
   thinkingBudget?: number
+  /**
+   * Serve models at the largest context window the official catalog declares
+   * for them instead of the window the official client picks by default
+   * (`--context-window`). Off leaves the CLI's own configured default alone.
+   *
+   * Only ever a switch between two catalog-declared windows: the value sent
+   * is read from the catalog, never computed, because the CLI accepts any
+   * number without complaint and would otherwise be handed a fiction.
+   */
+  contextWindowMax?: boolean
+  /**
+   * Model ids switched off in the picker. An empty list (the default) serves
+   * every model the roster carries.
+   *
+   * Held as a user preference rather than derived from the roster, so it
+   * survives a refresh: switching a model off and then having the CLI answer
+   * must not silently switch it back on.
+   */
+  hiddenModels?: string[]
 }
 
 /** Explicit CLI override (shared by the plugin schema and its section). */
@@ -166,11 +202,28 @@ const THINKING_FIELD = z.union(QODER_THINKING_MODES)
 const THINKING_BUDGET_FIELD = z.number()
   .description('Fixed thinking token budget (--thinking-budget); 0 uses the CLI default')
 
+/**
+ * Context-window switch. A boolean rather than a number on purpose: the
+ * number is a per-model fact from the official catalog, so persisting one
+ * here would freeze a value that goes stale the moment Qoder re-declares it.
+ */
+const CONTEXT_WINDOW_MAX_FIELD = z.boolean()
+  .description('Serve models at the largest context window the official catalog declares (--context-window)')
+
+/**
+ * Switched-off model ids. An array rather than a per-model map so the card can
+ * write the whole set at once — a batch "hide all" is one request, not N.
+ */
+const HIDDEN_MODELS_FIELD = z.array(z.string())
+  .description('Model ids to hide from the model picker')
+
 export const Config: z<Config> = z.object({
   cli: CLI_FIELD,
   reasoningEffort: REASONING_EFFORT_FIELD,
   thinking: THINKING_FIELD,
   thinkingBudget: THINKING_BUDGET_FIELD,
+  contextWindowMax: CONTEXT_WINDOW_MAX_FIELD,
+  hiddenModels: HIDDEN_MODELS_FIELD,
 })
 
 /** The settings section: only the fields the card edits. */
@@ -179,10 +232,30 @@ const SECTION: z<Config> = z.object({
   reasoningEffort: REASONING_EFFORT_FIELD,
   thinking: THINKING_FIELD,
   thinkingBudget: THINKING_BUDGET_FIELD,
+  contextWindowMax: CONTEXT_WINDOW_MAX_FIELD,
+  hiddenModels: HIDDEN_MODELS_FIELD,
 })
 
+/**
+ * Resolve the explicit `--context-window` for one CLI model name.
+ *
+ * Reads the same official-catalog snapshot the adapter reports from, so the
+ * window on the wire and the window in the picker are always the same number.
+ * Undefined — the default mode, or a model the catalog does not describe —
+ * omits the flag and leaves the CLI's own configured window alone.
+ */
+function contextWindowResolver(mode: QoderContextWindowMode, facts: () => ReadonlyMap<string, QoderModelFacts>) {
+  return (cliModel: string): number | undefined => {
+    if (mode !== 'max') return undefined
+    const windows = facts().get(cliModel.toLowerCase())?.contextWindows
+    if (windows === undefined || windows.length === 0) return undefined
+    // Sorted ascending by the parser, so the last entry is the maximum.
+    return windows[windows.length - 1]
+  }
+}
+
 /** Effective qoder CLI options for one config snapshot. */
-function qoderOptionsFor(config: Config): QoderOptions {
+function qoderOptionsFor(config: Config, resolveContextWindow?: (cliModel: string) => number | undefined): QoderOptions {
   const options: QoderOptions = {}
   if (config.cli !== undefined && config.cli !== '') options.command = config.cli
   // Only a non-empty selection becomes a flag, so an unset field leaves the
@@ -191,6 +264,10 @@ function qoderOptionsFor(config: Config): QoderOptions {
   if (config.thinking !== undefined) options.thinking = config.thinking
   if (typeof config.thinkingBudget === 'number' && config.thinkingBudget > 0) {
     options.thinkingBudget = config.thinkingBudget
+  }
+  if (config.contextWindowMax === true) {
+    options.contextWindowMax = true
+    if (resolveContextWindow !== undefined) options.resolveContextWindow = resolveContextWindow
   }
   return options
 }
@@ -205,7 +282,11 @@ function qoderOptionsFor(config: Config): QoderOptions {
  * @returns whether the provider registered.
  */
 async function start(ctx: Context, config: Config): Promise<boolean> {
-  const shim = createQoderShim({ qoder: qoderOptionsFor(config), logger: ctx.logger })
+  // The shim reads the qoder options through a thunk, so a setting edited on
+  // the card reaches the next chat run without a restart — the previous
+  // snapshot-at-startup behaviour meant a reasoning or context-window change
+  // silently waited for the next DSH launch.
+  const shim = createQoderShim({ qoder: () => qoderOptionsFor(current(), resolveContextWindow), logger: ctx.logger })
   try {
     await shim.ready
   } catch (error: unknown) {
@@ -214,6 +295,12 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
   }
 
   const catalog = new QoderCatalog()
+  // Adopt the persisted switches before anything is served, so a restart does
+  // not briefly offer models the user had switched off.
+  if (Array.isArray(config.hiddenModels) && catalog.setHidden(config.hiddenModels)) {
+    // Nothing to publish yet — the adapter is constructed below and reads the
+    // catalog through `current()`, which already reflects the hidden set.
+  }
   // Live configuration source: starts as the applied config and is replaced
   // by the settings section's source once one is installed, so a CLI
   // override edited in settings reaches the readiness sweep at once.
@@ -232,6 +319,15 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
    * this in the background and the adapter only reads the last snapshot.
    */
   let modelFacts = new Map<string, QoderModelFacts>()
+  /** Which context window the models are served at, read live per request. */
+  const contextWindowMode = (): QoderContextWindowMode =>
+    current().contextWindowMax === true ? 'max' : 'default'
+  /**
+   * The explicit `--context-window` for one CLI model name, or undefined to
+   * omit the flag. Resolved from the same facts snapshot the adapter reports
+   * from, so the wire value and the picker's number cannot drift apart.
+   */
+  const resolveContextWindow = contextWindowResolver(contextWindowMode(), () => modelFacts)
   try {
     // Constructed only once the listener holds a port: the provider's
     // models read the shim origin at construction time.
@@ -240,6 +336,7 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
       catalog,
       resolveAttachments: () => ctx.get('attachments'),
       modelFacts: () => modelFacts,
+      contextWindowMode,
     })
     invalidate = (): void => {
       qoder.invalidate()
@@ -308,6 +405,9 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
    * Serialized so two triggers (startup and a readiness flip) cannot spawn
    * the CLI twice at once, and best-effort: a failure leaves the previous
    * roster in place rather than emptying the group.
+   *
+   * A live answer is also persisted, which is what keeps the *next* run from
+   * degrading to the built-in snapshot while it waits for this one.
    */
   let refreshing: Promise<void> | undefined
   const refreshModels = (): Promise<void> => {
@@ -318,6 +418,10 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
           ctx.logger.warn('dsh-qoder-connect: could not list models from the CLI; keeping the current roster')
           return
         }
+        // Persist before publishing: the saved copy is what the next restart
+        // serves while its own fetch is in flight, so it must reflect the
+        // answer that just landed, not the one before it.
+        await saveQoderRoster(models.map(model => ({ id: model.externalId, name: model.cliModel })))
         if (catalog.setModels(models, 'cli')) {
           invalidate()
           ctx.logger.info(`dsh-qoder-connect: model roster refreshed from the CLI (${models.length} models)`)
@@ -382,7 +486,18 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
   // official catalog is what carries price, context windows and per-model
   // thinking levels. Neither is ever re-read on a timer — only the card's
   // refresh button asks for both again.
-  void refreshAll()
+  //
+  // The saved roster is adopted *before* the fetch starts, so a machine that
+  // has run before shows its account's real models immediately instead of the
+  // compiled snapshot — the CLI answer replaces it the moment it lands.
+  void (async () => {
+    const saved = await loadQoderRoster()
+    if (saved !== null && catalog.hydrate(saved.models)) {
+      invalidate()
+      ctx.logger.info(`dsh-qoder-connect: serving the roster saved at ${new Date(saved.savedAt).toISOString()} (${saved.models.length} models)`)
+    }
+    await refreshAll()
+  })()
 
   // Same-origin routes backing the Plugin-configuration card: the status
   // read, plus the write route for the reasoning controls. The webServer
@@ -413,6 +528,11 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
         // The CLI override changed: drop the cached resolution so the new
         // command is probed, then re-check readiness at once.
         clearQoderCliCache()
+        // A context-window switch or a model toggle changes what the picker
+        // serves, so the snapshot has to be republished — otherwise it keeps
+        // showing the window and the roster that were in effect before.
+        if (catalog.setHidden(current().hiddenModels ?? [])) invalidate()
+        invalidate()
         sweep()
       },
     })

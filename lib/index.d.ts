@@ -110,6 +110,27 @@ interface QoderOptions {
   thinkingBudget?: number;
   /** Home directory to probe; defaults to `os.homedir()`. */
   homeDir?: string;
+  /**
+   * Serve models at the largest context window the official catalog declares
+   * for them (`--context-window`) instead of the window the official client
+   * picks by default. Recorded here so the status card can show what is in
+   * effect; the value itself comes from {@link QoderOptions.resolveContextWindow}.
+   */
+  contextWindowMax?: boolean;
+  /**
+   * Resolve the explicit `--context-window` value for one CLI model name.
+   *
+   * A resolver rather than a number because the window is a per-model fact:
+   * the official catalog lists several windows per model (typically 200K /
+   * 400K / 1M) and only the caller holding that catalog knows which are real.
+   * Returning undefined omits the flag, which leaves the CLI's own configured
+   * default in place.
+   *
+   * The value is passed through unvalidated on purpose: the CLI accepts any
+   * number without complaint (verified — `--context-window 999` runs), so
+   * guarding has to happen where the catalog is known, not here.
+   */
+  resolveContextWindow?: (cliModel: string) => number | undefined;
   /** Abort signal for one chat run. */
   signal?: AbortSignal;
   /**
@@ -288,26 +309,62 @@ interface QoderCatalogEntry {
   /** The CLI's own spelling, shown as the display name. */
   name: string;
 }
+/** Where the current roster came from, best tier first. */
+type QoderRosterSource = 'cli' | 'saved' | 'builtin';
 /** The live catalog: the roster plus its current visibility. */
 declare class QoderCatalog {
   private entries;
   private visible;
   /** Where the current roster came from, for the settings card. */
   private rosterSource;
+  /**
+   * Model ids the user switched off. Kept apart from the roster because it is
+   * a user preference, not a fact about Qoder: the roster is replaced wholesale
+   * by every refresh, while a hidden id must survive one — otherwise switching
+   * a model off would silently un-hide it the next time the CLI answered.
+   */
+  private hidden;
   constructor(models?: readonly QoderModel[]);
   /** The rows to serve; empty while hidden. */
   current(): readonly QoderCatalogEntry[];
   /** Every row, whether or not the group is currently shown. */
   all(): readonly QoderCatalogEntry[];
+  /** Every row with its on/off state, for the card's model switches. */
+  withVisibility(): Array<QoderCatalogEntry & {
+    on: boolean;
+  }>;
+  /** The ids currently switched off. */
+  hiddenIds(): readonly string[];
   /** Whether the group is currently shown. */
   isVisible(): boolean;
-  /** Whether the roster is the CLI's live answer or the built-in fallback. */
-  source(): 'builtin' | 'cli';
+  /** Where the current roster came from. */
+  source(): QoderRosterSource;
   /**
    * Set visibility.
    * @returns whether the state actually changed.
    */
   setVisible(visible: boolean): boolean;
+  /**
+   * Replace the set of switched-off model ids.
+   *
+   * Ids the roster does not know are kept anyway: a model hidden while the
+   * built-in fallback served must stay hidden after the CLI's own roster
+   * arrives, or the switch would appear to undo itself.
+   *
+   * @returns whether the served rows actually changed.
+   */
+  setHidden(ids: readonly string[]): boolean;
+  /**
+   * Adopt the persisted roster from a previous run.
+   *
+   * Only ever called at startup, before the CLI is asked: it is the tier that
+   * keeps a restart from showing the compiled snapshot while the real answer
+   * is still being fetched. A live answer that arrives later replaces it
+   * through {@link setModels} and is persisted in turn.
+   *
+   * @returns whether the served rows actually changed.
+   */
+  hydrate(entries: readonly QoderCatalogEntry[]): boolean;
   /**
    * Replace the roster with a freshly fetched one.
    *
@@ -318,7 +375,7 @@ declare class QoderCatalog {
    *
    * @returns whether the served rows actually changed.
    */
-  setModels(models: readonly QoderModel[], source?: 'builtin' | 'cli'): boolean;
+  setModels(models: readonly QoderModel[], source?: 'cli' | 'builtin'): boolean;
 }
 //#endregion
 //#region src/model-catalog.d.ts
@@ -508,8 +565,14 @@ interface QoderShim {
 }
 /** Constructor dependencies. */
 interface QoderShimOptions {
-  /** Qoder CLI overrides (command, PAT, home dir); env vars still apply. */
-  qoder?: QoderOptions;
+  /**
+   * Qoder CLI overrides (command, PAT, home dir); env vars still apply.
+   *
+   * A thunk is read once per request rather than snapshotted at construction,
+   * so a setting edited on the card reaches the next chat run without a
+   * restart. A plain object is still accepted and behaves as a constant.
+   */
+  qoder?: QoderOptions | (() => QoderOptions);
   logger?: ShimLogger;
 }
 /**
@@ -524,6 +587,16 @@ declare function createQoderShim(options?: QoderShimOptions): QoderShim;
 declare const QODER_PROVIDER = "qoder";
 /** Provider idle ceiling while one stream read is outstanding. */
 declare const QODER_STREAM_IDLE_TIMEOUT_MS = 300000;
+/**
+ * Which context window a model is served at.
+ *
+ * `default` is the window the official client itself uses (the catalog's
+ * `is_default` entry); `max` is the largest window the catalog declares for
+ * that model, which the upstream serves but the client does not select by
+ * default. The choice rides on `--context-window` per request and is reported
+ * to the picker, so the two never disagree about what is in effect.
+ */
+type QoderContextWindowMode = 'default' | 'max';
 /** Constructor dependencies. */
 interface QoderAdapterOptions {
   shim: QoderShim;
@@ -543,6 +616,12 @@ interface QoderAdapterOptions {
    * get a working picker, so this can never be a required input.
    */
   modelFacts?: () => ReadonlyMap<string, QoderModelFacts>;
+  /**
+   * Which context window the models are served at. A thunk, like
+   * {@link QoderAdapterOptions.modelFacts}, so a switch flipped on the card
+   * republishes with the next snapshot instead of freezing at startup.
+   */
+  contextWindowMode?: () => QoderContextWindowMode;
 }
 /** What {@link createQoderAdapter} hands back. */
 interface QoderAdapter {
@@ -561,6 +640,127 @@ interface QoderAdapter {
  * every newly required field must be adopted here explicitly.
  */
 declare function createQoderAdapter(options: QoderAdapterOptions): QoderAdapter;
+//#endregion
+//#region src/catalog-store.d.ts
+/**
+ * Durable copy of the last roster the CLI actually reported.
+ *
+ * The served roster has three tiers, best first:
+ *
+ * 1. **live** — `qoderclicn --list-models` answered just now;
+ * 2. **saved** — the last live answer, persisted here;
+ * 3. **builtin** — the snapshot compiled into the plugin.
+ *
+ * Tier 2 is what this module exists for. Without it a restart — or a CLI
+ * that answers `null` because it is mid-upgrade, not on PATH in a new shell,
+ * or simply slow — drops the picker straight from live to builtin, so a
+ * machine that had this account's real model list silently shows a stale
+ * one. The saved copy is written only from a successful live answer, so it
+ * can never be worse than what the CLI itself reported.
+ *
+ * The file is the plugin's own rebuildable state, so it lives beside the
+ * ledger under `$DSH_HOME/qoder-connect/` and is safe to delete: losing it
+ * costs one CLI spawn to rebuild, never correctness.
+ *
+ * @module dsh-qoder-connect/catalog-store
+ */
+/** One persisted roster row. */
+interface QoderSavedModel {
+  /** The DSH-facing model id. */
+  id: string;
+  /** The CLI's own spelling. */
+  name: string;
+}
+/** The persisted document. */
+interface QoderSavedRoster {
+  /** Schema version; anything else is discarded rather than migrated. */
+  version: 1;
+  /** Epoch ms when a live answer was last persisted. */
+  savedAt: number;
+  /** The roster, in the order the CLI reported it. */
+  models: QoderSavedModel[];
+}
+/** Where the saved roster lives: `$DSH_HOME/qoder-connect/roster.json`. */
+declare function qoderRosterPath(): string;
+/**
+ * Read the saved roster.
+ *
+ * Every failure mode — missing file, unreadable JSON, a foreign schema, an
+ * empty or malformed roster — answers `null` rather than throwing, because
+ * the caller's fallback (the built-in list) is a perfectly good answer and a
+ * corrupt cache must never cost the plugin its startup.
+ */
+declare function loadQoderRoster(): Promise<QoderSavedRoster | null>;
+/**
+ * Persist a live roster.
+ *
+ * Written through a temp file and a rename so a crash mid-write cannot leave
+ * a truncated document behind — the next read would otherwise discard the
+ * whole cache over a half-written line.
+ *
+ * Never throws: a failed write costs the next restart's tier, not this run.
+ */
+declare function saveQoderRoster(models: readonly QoderSavedModel[]): Promise<void>;
+//#endregion
+//#region src/images.d.ts
+/**
+ * Image attachments for the qoder route.
+ *
+ * The CLI's prompt is one argv string, which is why this plugin long declared
+ * `input: ['text']`. That reasoning was incomplete: `qoderclicn` also accepts
+ * `--attachment <file>`, and the upstream models the official catalog marks
+ * `is_vl` really do read the attached image — verified by handing the CLI a
+ * logo and getting its text back. So an image never has to be flattened into
+ * the prompt at all; it rides as a file path beside it.
+ *
+ * What this module does is only the plumbing between the two surfaces: DSH
+ * sends images as base64 data URLs inside OpenAI message content parts, and
+ * the CLI wants filesystem paths. So the data URLs are decoded into a
+ * private temp directory whose lifetime is exactly one run.
+ *
+ * Three deliberate restrictions, all inherited from the CLI surface rather
+ * than invented here:
+ *
+ * - **Data URLs only.** A remote `http(s)` image URL is skipped, not fetched:
+ *   the plugin makes no upstream HTTP request anywhere, and DSH's own
+ *   attachment pipeline hands images over as data URLs.
+ * - **base64 only.** A percent-encoded data URL carries no bytes to decode.
+ * - **Bounded.** The host already caps request images (see the adapter's
+ *   REQUEST_IMAGE_BUDGETS); a second, independent ceiling here keeps a
+ *   malformed or hostile body from filling the temp volume.
+ *
+ * @module dsh-qoder-connect/images
+ */
+/** What {@link materializeImageAttachments} produced for one run. */
+interface QoderImageMaterial {
+  /** Temp file paths to pass as `--attachment`, in the order they appeared. */
+  paths: string[];
+  /**
+   * Image parts that were seen but could not be turned into a file — a
+   * remote URL, an unsupported encoding, an oversized body, or a malformed
+   * data URL. Surfaced so a caller can tell "no images" from "images lost".
+   */
+  skipped: number;
+}
+/**
+ * Materialize every image in an OpenAI `messages` array as a temp file.
+ *
+ * The whole request shares one temp directory, so a caller that only keeps
+ * {@link QoderImageMaterial.paths} can dispose of the run's scratch space with
+ * a single recursive remove.
+ *
+ * Never throws: a filesystem failure while materializing is reported as
+ * `skipped`, because losing an image must degrade the turn to text rather
+ * than fail it.
+ */
+declare function materializeImageAttachments(messages: unknown): Promise<QoderImageMaterial>;
+/**
+ * Remove one run's materialized images.
+ *
+ * Every path came from the same temp directory, so the directory is removed
+ * recursively and the individual paths are best-effort. Never throws.
+ */
+declare function disposeImageAttachments(paths: readonly string[]): Promise<void>;
 //#endregion
 //#region src/ledger.d.ts
 /**
@@ -627,6 +827,11 @@ interface QoderWebModel {
   /** The CLI's own spelling, e.g. `Qwen3.8-Max`. */
   name: string;
 }
+/** One model with its on/off state, for the card's model switches. */
+interface QoderWebModelSwitch extends QoderWebModel {
+  /** Whether the model is offered in the picker. */
+  on: boolean;
+}
 /** The reasoning controls currently in effect, as the card renders them. */
 interface QoderWebReasoning {
   /** Selected `--reasoning-effort`, or '' when the flag is not sent. */
@@ -636,16 +841,27 @@ interface QoderWebReasoning {
   /** Selected `--thinking-budget`, or 0 when the flag is not sent. */
   budget: number;
 }
+/** The context-window switch currently in effect, as the card renders it. */
+interface QoderWebContextWindow {
+  /**
+   * Whether models are served at the largest window the official catalog
+   * declares for them (`--context-window`) rather than the window the
+   * official client picks by default.
+   */
+  max: boolean;
+}
 /**
- * Where the served model roster came from.
+ * Where the served model roster came from, best tier first.
  *
- * `cli` means `qoderclicn --list-models` answered, so the picker shows this
- * account's own models — including any Qoder added after this plugin
- * shipped. `builtin` means the fetch did not answer and the shipped fallback
- * stands, which is worth surfacing: a silently stale roster is exactly what
- * makes a newly added model look missing.
+ * `cli` means `qoderclicn --list-models` answered just now, so the picker
+ * shows this account's own models — including any Qoder added after this
+ * plugin shipped. `saved` means the CLI could not answer this time and the
+ * roster persisted from its last successful answer is standing in. `builtin`
+ * means neither was available and the compiled fallback serves, which is
+ * worth surfacing: a silently stale roster is exactly what makes a newly
+ * added model look missing.
  */
-type QoderRosterSource = 'cli' | 'builtin';
+type QoderRosterSource$1 = 'cli' | 'saved' | 'builtin';
 /** The JSON document the plugin card renders. */
 type QoderWebStatus = {
   status: 'ready';
@@ -658,10 +874,15 @@ type QoderWebStatus = {
   /** Human-readable readiness explanation. */
   reason: string;
   models: readonly QoderWebModel[];
+  /** Every model with its on/off state, so the card can render switches
+   *  for models that are currently hidden too. */
+  switches: readonly QoderWebModelSwitch[];
   /** The reasoning controls in effect for this configuration. */
   reasoning: QoderWebReasoning;
+  /** The context-window switch in effect for this configuration. */
+  contextWindow: QoderWebContextWindow;
   /** Whether the roster is the CLI's live answer or the built-in fallback. */
-  rosterSource: QoderRosterSource;
+  rosterSource: QoderRosterSource$1;
 } | {
   status: 'not-ready';
   /** Why no chat request can be served right now. */
@@ -676,8 +897,13 @@ type QoderWebStatus = {
   oauthFile: string;
   /** The reasoning controls in effect for this configuration. */
   reasoning: QoderWebReasoning;
+  /** The context-window switch in effect for this configuration. */
+  contextWindow: QoderWebContextWindow;
+  /** Every model with its on/off state, so the card can render switches
+   *  for models that are currently hidden too. */
+  switches: readonly QoderWebModelSwitch[];
   /** Whether the roster is the CLI's live answer or the built-in fallback. */
-  rosterSource: QoderRosterSource;
+  rosterSource: QoderRosterSource$1;
 } | {
   status: 'error';
   message: string;
@@ -719,13 +945,28 @@ interface QoderStatusRouteOptions {
  * reject outright.
  */
 declare function qoderWebReasoning(qoder?: QoderOptions): QoderWebReasoning;
+/**
+ * The context-window switch as the card renders it.
+ *
+ * Read off the live options rather than from a stored setting, so the card
+ * shows what is actually in effect for the next request — including a value
+ * edited elsewhere while the card was open.
+ */
+declare function qoderWebContextWindow(qoder?: QoderOptions): QoderWebContextWindow;
+/**
+ * Assemble the card's status document. Readiness is read-only; nothing here
+ * contacts the network — the CLI probe is a local `--version` spawn.
+ */
+declare function qoderWebStatus(deps: QoderStatusRouteOptions): QoderWebStatus;
 /** Mount the GET status route on an optional webServer context. */
 declare function registerQoderStatusRoute(ctx: Context, deps: QoderStatusRouteOptions): void;
-/** One validated reasoning-control write. */
-interface ReasoningPatch {
+/** One validated settings write from the card. */
+interface QoderConfigPatch {
   reasoningEffort?: string;
   thinking?: string;
   thinkingBudget?: number;
+  contextWindowMax?: boolean;
+  hiddenModels?: string[];
 }
 /**
  * Validate one posted patch against the CLI's own vocabularies.
@@ -734,12 +975,24 @@ interface ReasoningPatch {
  * must be refused at the edge rather than persisted and then replayed into
  * every later request. `''` is accepted for the two selects and means "do not
  * send this flag"; the empty string cannot reach the schema as a valid level.
+ *
+ * `contextWindowMax` is a plain boolean — the number it stands for is a
+ * per-model fact read from the official catalog at request time, so there is
+ * nothing here for a caller to get wrong.
  */
-declare function parseReasoningPatch(body: unknown): {
-  patch: ReasoningPatch;
+declare function parseQoderConfigPatch(body: unknown): {
+  patch: QoderConfigPatch;
 } | {
   error: string;
 };
+/**
+ * Backwards-compatible alias for {@link parseQoderConfigPatch}.
+ *
+ * The route outgrew its original name when the context-window switch joined
+ * the reasoning controls, but the reasoning spelling is what the existing
+ * call sites and tests use, so it stays available.
+ */
+declare const parseReasoningPatch: typeof parseQoderConfigPatch;
 /**
  * The write route's handler: validate the patch, then merge it into the
  * plugin's own settings namespace so the change is durable and reaches the
@@ -776,8 +1029,27 @@ interface Config {
    * flag; the CLI treats it as implying thinking enabled.
    */
   thinkingBudget?: number;
+  /**
+   * Serve models at the largest context window the official catalog declares
+   * for them instead of the window the official client picks by default
+   * (`--context-window`). Off leaves the CLI's own configured default alone.
+   *
+   * Only ever a switch between two catalog-declared windows: the value sent
+   * is read from the catalog, never computed, because the CLI accepts any
+   * number without complaint and would otherwise be handed a fiction.
+   */
+  contextWindowMax?: boolean;
+  /**
+   * Model ids switched off in the picker. An empty list (the default) serves
+   * every model the roster carries.
+   *
+   * Held as a user preference rather than derived from the roster, so it
+   * survives a refresh: switching a model off and then having the CLI answer
+   * must not silently switch it back on.
+   */
+  hiddenModels?: string[];
 }
 declare const Config: z<Config>;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, QODER_CONFIG_PATH, QODER_CONNECT_VERSION, QODER_DEFAULT_MODEL, QODER_MAX_THINKING_BUDGET, QODER_MODELS, QODER_PROVIDER, QODER_REASONING_EFFORTS, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_THINKING_MODES, QODER_TIMEOUT_MS, type QoderAdapter, QoderCatalog, type QoderCatalogEntry, type QoderCatalogSnapshot, type QoderLedgerEntry, type QoderModelFacts, type QoderPromotion, type QoderReasoningEffort, type QoderRunResult, type QoderShim, type QoderStatus, type QoderThinkingMode, type QoderWebReasoning, type QoderWebStatus, aggregateQoderChunks, appendQoderLedgerEntry, apply, buildCliPrompt, buildReasoningArgs, clearQoderCliCache, cliModelFor, createQoderAdapter, createQoderShim, decryptQmcCatalog, fetchQoderModels, formatQoderPrice, inject, loadQoderModelFacts, name, parseCatalogDocument, parseCliDelta, parseCliResult, parseListModelsOutput, parseReasoningPatch, qoderChatStream, qoderConfigHandler, qoderExternalId, qoderLedgerPath, qoderOauthUserCandidates, qoderOauthUserPath, qoderStatus, qoderWebReasoning, registerQoderRoutes, registerQoderStatusRoute, thinkingLevelMapFor };
+export { Config, QODER_CONFIG_PATH, QODER_CONNECT_VERSION, QODER_DEFAULT_MODEL, QODER_MAX_THINKING_BUDGET, QODER_MODELS, QODER_PROVIDER, QODER_REASONING_EFFORTS, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_THINKING_MODES, QODER_TIMEOUT_MS, type QoderAdapter, QoderCatalog, type QoderCatalogEntry, type QoderCatalogSnapshot, type QoderContextWindowMode, type QoderImageMaterial, type QoderLedgerEntry, type QoderModelFacts, type QoderPromotion, type QoderReasoningEffort, type QoderRosterSource, type QoderRunResult, type QoderSavedModel, type QoderSavedRoster, type QoderShim, type QoderStatus, type QoderThinkingMode, type QoderWebContextWindow, type QoderWebReasoning, type QoderWebStatus, aggregateQoderChunks, appendQoderLedgerEntry, apply, buildCliPrompt, buildReasoningArgs, clearQoderCliCache, cliModelFor, createQoderAdapter, createQoderShim, decryptQmcCatalog, disposeImageAttachments, fetchQoderModels, formatQoderPrice, inject, loadQoderModelFacts, loadQoderRoster, materializeImageAttachments, name, parseCatalogDocument, parseCliDelta, parseCliResult, parseListModelsOutput, parseQoderConfigPatch, parseReasoningPatch, qoderChatStream, qoderConfigHandler, qoderExternalId, qoderLedgerPath, qoderOauthUserCandidates, qoderOauthUserPath, qoderRosterPath, qoderStatus, qoderWebContextWindow, qoderWebReasoning, qoderWebStatus, registerQoderRoutes, registerQoderStatusRoute, saveQoderRoster, thinkingLevelMapFor };

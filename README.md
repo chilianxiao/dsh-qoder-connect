@@ -10,9 +10,12 @@
 
 - **开箱即用**：插件复用 `qoderclicn login` 落盘的登录态，不另起 OAuth 流程；没有上游 HTTP 请求——本机 CLI 就是上游。
 - **模型分组**：Qoder 模型以「Qoder」分组出现在模型选择器中；未安装 CLI 或未登录时分组自动隐藏，登录后（无需重启 DSH）自动出现。
-- **模型列表**：启动时跑一次 `qoderclicn --list-models`，之后只在设置卡片上点「重新拉取模型」时再拉，所以 **Qoder 新增模型无需更新插件就能出现在选择器里**；拉取失败则保留现有列表（内置兜底），不会让整个分组消失，卡片上会标明当前列表来自 CLI 还是内置兜底。就绪状态由假变真时分组会**显示**出来，但此时用的是内置兜底表，要点一下刷新才会换成账号的真实列表。
+- **模型列表**：启动时跑一次 `qoderclicn --list-models`，之后只在设置卡片上点「重新拉取模型」时再拉，所以 **Qoder 新增模型无需更新插件就能出现在选择器里**；拉取失败则保留现有列表（上次成功结果已落盘），不会让整个分组消失，卡片上会标明当前列表来自 CLI、上次保存还是内置兜底。就绪状态由假变真时分组会**显示**出来，此时用的是上次保存的列表，点一下刷新即可换成账号的真实列表。
 - **登录态自动探测**：三种布局都认——`~/.qoderworkcn/.auth-cn/user`（proxy-hub 文档布局）、`~/.qoder-cn/.auth/user`（Qoder CN CLI，实测）、`~/.qoder/.auth/user`（国际版 qodercli）；也支持环境变量 `QODERCN_PERSONAL_ACCESS_TOKEN`。
 - **CLI 不在 PATH 也能用**：按 PATH → 默认安装目录（`~/.qoder-cn/bin/qoderclicn`、`~/.qoder/bin/qodercli`）顺序解析，Windows `.cmd` shim 走 shell 正确启动。
+- **图片输入**：官方目录标了 `is_vl` 的模型，在选择器里声明图片能力；请求里的图片以 `--attachment` 交给 CLI，**不经过任何上游 HTTP**。只支持 data URL（DSH 附件管道给的正是这个形态），远程图片地址会被跳过而不是发起请求。
+- **上下文窗口一键切换**：设置卡片提供「使用上游声明的最大窗口」开关。开启后按各模型声明的最大窗口请求（如 1M），关闭则用官方客户端默认的窗口（通常 200K）。数值**只取自官方目录声明的档位**——CLI 对 `--context-window` 不校验，凭空给一个数没有意义。
+- **模型开关**：设置卡片的「模型开关」区可逐个关闭不想用的模型，关闭的即从模型选择器隐藏；带即时搜索框与「全部开启 / 全部关闭」。列表覆盖全部模型（含已关闭的），所以关掉的模型随时能开回来。
 - **设置卡片**：设置 → 插件 → Qoder 卡片展示 CLI 路径、登录方式、登录态文件与可用模型，未就绪时给出修复提示。
 - **模型选择器里选推理档位**：Qoder 模型在 DSH 模型选择器中带「推理等级」选项（low / medium / high / xhigh / max），按模型生效、逐次请求下发，做法与 [dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) 一致——模型用 `thinkingLevelMap` 声明可用档位，DSH 把选中的档位作为 `reasoning_effort` 放进请求体，插件再翻成 CLI 的 `--reasoning-effort`。
 - **模型选择器里显示官方系数与逐模型档位**：读取官方客户端缓存的加密模型目录（QMC v1），把官方 `price_factor`（含错峰促销）与**该模型真正接受的推理档位**带进选择器。详见下文「官方目录」。
@@ -158,6 +161,8 @@ dsh plugin --profile web add link:D:/dsh_web/plugins/qoder-connect
 | 设置项 `reasoningEffort` | 空 | `--reasoning-effort`，可选 `auto` / `none` / `low` / `medium` / `high` / `xhigh` / `max` / `ultracode` |
 | 设置项 `thinking` | 空 | `--thinking`，可选 `auto` / `adaptive` / `enabled` / `disabled` |
 | 设置项 `thinkingBudget` | 空 | `--thinking-budget` 固定思考 token 数（CLI 侧隐含开启 thinking），0–1000000 |
+| 设置项 `contextWindowMax` | `false` | 按官方目录声明的最大上下文窗口请求（`--context-window`） |
+| 设置项 `hiddenModels` | `[]` | 要从模型选择器隐藏的模型 id 列表 |
 
 推理三项都在设置卡片的「推理设置」区编辑，写入插件自己的 `qoder` 设置命名空间因而持久化；留空表示不下发该参数，跟随 CLI 自身默认。它们是**全局兜底**：模型选择器里选的档位优先于 `reasoningEffort`。取值按 CLI 1.1.59 实测的可选列表校验——**非法值会被 CLI 直接判为致命错误并终止本次请求**（`Invalid reasoning effort: ...`），所以写入前在插件侧就拒掉。
 
@@ -182,21 +187,29 @@ DSH 模型选择器
 loopback shim（127.0.0.1 随机端口，/v1/models + /v1/chat/completions）
    │  每请求 spawn 一次 CLI，解析 stream-json
    ▼
-qoderclicn --print --output-format stream-json --model <模型> [--reasoning-effort <级别>] [--thinking <模式>] [--thinking-budget <n>] -- <prompt>
+qoderclicn --print --output-format stream-json --model <模型>
+           [--reasoning-effort <级别>] [--thinking <模式>] [--thinking-budget <n>]
+           [--context-window <窗口>] [--attachment <图片>…]
+           -- <prompt>
 ```
 
 - **shim 只绑 127.0.0.1**，且要求请求带 loopback Host、loopback Origin 和每进程随机的 Bearer 密钥（pi-ai 通过 `resolveApiKey` 拿到它）；本地其他进程无法冒用。
 - **模型列表**：启动时就绪轮询之外**单独**跑一次 `--list-models`（超时 20s），解析「`MODEL` 表头 + 每行一个名字」，去重后按 `qoder-` + 小写名生成 id 替换目录；就绪状态由假变真时（例如刚 login）再跑一次。任何失败（无 CLI、非零退出、解析为空、超时）都返回 null 并保留现有列表——目录为空会让 DSH 把整个 Qoder 分组从选择器里隐藏，比列表过期更糟。
 - **模型名带官方系数**：`Model.name` = CLI 拼写 + 官方 `price_factor`（+ 促销徽标），`Model.id` 保持小写化 id 不变——id 是上线请求与账本的主键，装饰它会同时破坏两者。读不到官方目录时名称退回纯 CLI 拼写。
 - **官方目录**：启动时读一次 `<home>/.models/<uid>/catalog-v6`，用 HKDF-SHA256 + AES-256-GCM（Node 内置 `crypto`）解出 `chat` 场景，得到逐模型的 `price_factor`、`thinking_config` 档位表与上下文窗口。之后只在设置卡片点「重新拉取模型」时随模型列表一起重读，**无定时轮询**；内容有变才重建模型目录。
+- **模型列表三级降级**：`cli`（本次 CLI 实答）→ `saved`（上次成功实答，落盘在 `$DSH_HOME/qoder-connect/roster.json`）→ `builtin`（编译进插件的快照）。落盘的那一层是重启后不再退回内置表的原因：写只在实答成功后发生，所以它永远不会比 CLI 自己报过的更差；写走临时文件 + rename，崩溃不会留下半截文档。
+- **模型开关**：`hiddenModels` 是用户偏好而不是 Qoder 事实，所以它**不在**名单里、也不随刷新被替换——否则关掉一个模型后 CLI 一应答就自动开回来了。卡片写的是整个集合，一次请求搞定批量操作。
+- **图片输入**：请求体里的图片 part 解出 data URL，落成本次运行私有的临时文件（`os.tmpdir()` 下 mkdtemp），以 `--attachment <文件>` 传给 CLI，运行结束（含中断/超时）即在 `finally` 里删掉。data URL 之外一律跳过：远程地址不发起请求，非 base64 不猜，超过 8MB 或超过 16 张不要——宿主本身已有每请求图片预算，这里是第二道独立闸门。
+- **上下文窗口**：`contextWindowMax` 开启时按官方目录声明的最大窗口下发 `--context-window`，关闭则不下发该参数、跟随 CLI 自己的默认档。数值永远来自目录的 `context_config`，绝不计算——CLI 对这个参数不校验（实测 `--context-window 999` 也照跑），给一个没人声明过的数没有意义。
 - **流式**：CLI 每输出一个 `assistant` 文本增量，shim 立即转发一个 OpenAI chunk；**非流式**：聚合成一个 `chat.completion`。
 - **多轮历史**：CLI 只有一次性 prompt，插件把 system 提为 `--append-system-prompt`、其余消息拼接成一段——这是 CLI 表面的已知限制（对比：WorkBuddy 插件的上游是 HTTP API，messages 数组作为 JSON body 原生透传，没有这个问题）。**长会话自动截断**：Windows 命令行上限 32,767 字符，插件把拼出的 prompt 限制在 24,000 字符内——保留最新的消息、丢弃更早的，并在 prompt 开头注明"较早的 N 条消息已省略"，所以几十轮后的老会话也能用，只是模型看不到全部历史。`QODER_MAX_PROMPT_CHARS` / `QODER_MAX_SYSTEM_CHARS` 可调（均有钳制）。
 - **用量**：CLI 不上报 token，按 chars/4 估算（与 proxy-hub 一致）。
 - **上下文窗口**：优先用官方目录的 `context_config` 默认档（实测各模型为 200000）；读不到目录时退回保守默认 262144。`maxTokens`（32768）仍是本插件自己的估计——官方目录没有输出上限字段。
-- **图片输入不下发**：官方目录常标 `is_vl: true`（上游模型接受图片），但 CLI 的 prompt 是单个 argv 字符串，本插件无法转发图片，因此**不宣告**该能力（`input: ['text']`）。这是 CLI 表面的限制，不是上游模型能力。
 
 ## 已知限制
 
+- **图片只能来自 data URL**：DSH 附件管道给的正是这个形态，所以远程 `http(s)` 图片地址会被跳过而不发起请求——插件全程没有上游 HTTP。跳过的图片不会让整轮失败，只会退化成纯文本。
+- **多图与文本的对应关系是隐式的**：CLI 的 `--attachment` 只按顺序挂文件，不记录它属于哪条消息。同一轮里穿插多张图时，模型看到的是「全部图片 + 全部文本」，无法保证「图1 配 文1」。
 - 无工具调用透传。
 - 模型列表与官方目录都只在两个时机读取：**启动时**、以及**设置卡片上点「重新拉取模型」**（一次同时刷新 CLI 模型列表和官方目录的系数/档位/窗口）。没有定时轮询——模型列表要 spawn 一次 CLI（数秒），而官方目录文件由官方客户端自己发布，轮询只会重复读到同一个快照。就绪轮询仍是 30 秒一次的轻量本地凭证检查，但不触发任何拉取；内置兜底表仍需在发版时随 CLI 更新，它只在拉取失败时兜底。
 - 官方目录依赖**本机装了官方客户端并登录过**（否则 `catalog-v6` 不存在）：此时模型照常可用，但选择器里没有系数与档位。容器格式若被官方修改，解密会失败并回退到上述降级行为（不会崩）。刷新响应里带回 `factsCount`，可以据此判断系数与档位是否真的来自官方目录。
@@ -206,7 +219,7 @@ qoderclicn --print --output-format stream-json --model <模型> [--reasoning-eff
 ## 验证
 
 ```sh
-npm test        # node --test，65 个用例（stub CLI，无需登录）
+npm test        # node --test，116 个用例（stub CLI，无需登录）
 npm run build   # tsdown
 node scripts/live-chat-check.mjs qoder-qwen3.7-max   # 真实对话（消耗一次请求）
 ```

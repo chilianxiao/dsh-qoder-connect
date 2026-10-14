@@ -6,7 +6,7 @@ import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-locale/client'
 import { QODER_CONFIG_PATH, QODER_STATUS_PATH } from '../status-paths.ts'
-import type { QoderWebModel, QoderWebReasoning, QoderWebStatus } from '../status-paths.ts'
+import type { QoderWebContextWindow, QoderWebModel, QoderWebModelSwitch, QoderWebReasoning, QoderWebStatus } from '../status-paths.ts'
 import { isQoderWebStatus } from './status-document.ts'
 import { en } from './locales.ts'
 import type { QoderSettingsCopy, QoderSettingsKey } from './locales.ts'
@@ -257,6 +257,8 @@ function DetailBody({ status, readFailure, busy, onRefresh, onSaved, onRefetchMo
         <span style={monoStyle}>{status.oauthFile}</span>
       </FactRow>
       <ReasoningControls initial={status.reasoning} onSaved={onSaved} t={t} />
+      <ContextWindowSwitch initial={status.contextWindow} onSaved={onSaved} t={t} />
+      {ready ? <ModelSwitches switches={status.switches} onSaved={onSaved} t={t} /> : null}
       {!ready ? (
         <p style={bodyStyle}>
           {status.reason}
@@ -274,9 +276,15 @@ function DetailBody({ status, readFailure, busy, onRefresh, onSaved, onRefetchMo
           </div>
           <ModelChips models={status.models} />
           {/* Which roster is being served, because a stale built-in list is
-              exactly what makes a model Qoder just added look missing. */}
+              exactly what makes a model Qoder just added look missing. The
+              saved tier says so too: it is this account's real list, just
+              not one the CLI answered for this time. */}
           <span style={{ color: 'var(--dsw-alias-label-tertiary)', fontSize: 12 }}>
-            {status.rosterSource === 'cli' ? translate('rosterCli') : translate('rosterBuiltin')}
+            {status.rosterSource === 'cli'
+              ? translate('rosterCli')
+              : status.rosterSource === 'saved'
+                ? translate('rosterSaved')
+                : translate('rosterBuiltin')}
           </span>
           {modelNote !== undefined ? <p style={errorStyle}>{modelNote}</p> : null}
         </div>
@@ -408,6 +416,206 @@ function ReasoningControls({ initial, onSaved, t }: {
           </button>
         </span>
       </div>
+      {note !== undefined ? <p style={{ ...bodyStyle, fontSize: 13 }}>{note}</p> : null}
+      {failure !== undefined ? <p style={errorStyle}>{failure}</p> : null}
+    </div>
+  )
+}
+
+/**
+ * The context-window switch: one boolean that decides whether models are
+ * served at the largest window the official catalog declares for them.
+ *
+ * The number is never entered here — it is a per-model fact read from the
+ * catalog at request time, so a stale value typed by hand could never reach
+ * the CLI. The switch only chooses between two declared tiers.
+ *
+ * Saved immediately on toggle, like the refresh button: there is nothing to
+ * stage, and a half-applied window would make the picker and the wire
+ * disagree about what is in effect.
+ */
+function ContextWindowSwitch({ initial, onSaved, t }: {
+  initial: QoderWebContextWindow
+  onSaved: () => Promise<void>
+  t: QoderPluginCardProps['t']
+}): ReactNode {
+  const translate = t ?? fallbackT
+  const [max, setMax] = useState(initial.max)
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState<string>()
+  const [failure, setFailure] = useState<string>()
+
+  // Re-sync when the host reports a different stored value.
+  useEffect(() => { setMax(initial.max) }, [initial.max])
+
+  const save = useCallback(async (next: boolean): Promise<void> => {
+    setBusy(true)
+    setNote(undefined)
+    setFailure(undefined)
+    try {
+      const response = await fetch(QODER_CONFIG_PATH, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ contextWindowMax: next }),
+      })
+      const payload: unknown = await response.json().catch(() => undefined)
+      if (!response.ok) {
+        const message = (payload as { error?: unknown } | undefined)?.error
+        throw new Error(typeof message === 'string' && message !== '' ? message : `HTTP ${response.status}`)
+      }
+      setNote(translate('saved'))
+      await onSaved()
+    } catch (error: unknown) {
+      setFailure(error instanceof Error ? error.message : translate('requestFailed'))
+    } finally {
+      setBusy(false)
+    }
+  }, [onSaved, translate])
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 4 }}>
+      <span style={{ color: 'var(--dsw-alias-label-tertiary)', fontSize: 13 }}>{translate('contextWindow')}</span>
+      <div style={rowStyle}>
+        <span style={{ color: 'var(--dsw-alias-label-tertiary)', fontSize: 13 }}>{translate('contextWindowMax')}</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={max}
+          style={{ ...buttonStyle, minHeight: 30, padding: '4px 12px', borderRadius: 999, fontSize: 13, minWidth: 74 }}
+          disabled={busy}
+          onClick={() => { void save(!max).then(() => setMax(!max)) }}
+        >
+          {max ? translate('switchOn') : translate('switchOff')}
+        </button>
+      </div>
+      <span style={{ color: 'var(--dsw-alias-label-tertiary)', fontSize: 12, maxWidth: 420 }}>
+        {translate('contextWindowHint')}
+      </span>
+      {note !== undefined ? <p style={{ ...bodyStyle, fontSize: 13 }}>{note}</p> : null}
+      {failure !== undefined ? <p style={errorStyle}>{failure}</p> : null}
+    </div>
+  )
+}
+
+/**
+ * The model switches: which models the picker offers.
+ *
+ * The list is the whole roster, including what is currently off — a model
+ * that could not be reached from here could never be switched back on. A
+ * search box and the two batch buttons exist because the roster grows: Qoder
+ * adds models without a plugin update, so hand-toggling fourteen-plus entries
+ * one at a time is the thing this page has to make bearable.
+ *
+ * Every edit writes the whole set in one request. A per-model write would be
+ * N requests for what is one decision, and a batch "hide all" would be the
+ * worst case of it.
+ */
+function ModelSwitches({ switches, onSaved, t }: {
+  switches: readonly QoderWebModelSwitch[]
+  onSaved: () => Promise<void>
+  t: QoderPluginCardProps['t']
+}): ReactNode {
+  const translate = t ?? fallbackT
+  const [query, setQuery] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState<string>()
+  const [failure, setFailure] = useState<string>()
+
+  const write = useCallback(async (nextIds: readonly string[]): Promise<void> => {
+    setBusy(true)
+    setNote(undefined)
+    setFailure(undefined)
+    try {
+      const response = await fetch(QODER_CONFIG_PATH, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ hiddenModels: nextIds }),
+      })
+      const payload: unknown = await response.json().catch(() => undefined)
+      if (!response.ok) {
+        const message = (payload as { error?: unknown } | undefined)?.error
+        throw new Error(typeof message === 'string' && message !== '' ? message : `HTTP ${response.status}`)
+      }
+      await onSaved()
+    } catch (error: unknown) {
+      setFailure(error instanceof Error ? error.message : translate('requestFailed'))
+    } finally {
+      setBusy(false)
+    }
+  }, [onSaved, translate])
+
+  /** The ids currently off, which is what the write route wants. */
+  const hiddenIds = switches.filter(entry => !entry.on).map(entry => entry.id)
+
+  const toggle = useCallback(async (id: string): Promise<void> => {
+    const next = hiddenIds.includes(id)
+      ? hiddenIds.filter(candidate => candidate !== id)
+      : [...hiddenIds, id]
+    await write(next)
+  }, [hiddenIds, write])
+
+  const needle = query.trim().toLowerCase()
+  const shown = needle === ''
+    ? switches
+    : switches.filter(entry => entry.name.toLowerCase().includes(needle) || entry.id.includes(needle))
+  const allOn = switches.length > 0 && switches.every(entry => entry.on)
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 4 }}>
+      <span style={{ color: 'var(--dsw-alias-label-tertiary)', fontSize: 13 }}>{translate('modelSwitches')}</span>
+      <div style={rowStyle}>
+        <input
+          style={{ ...buttonStyle, minHeight: 30, padding: '4px 10px', borderRadius: 8, fontSize: 13, minWidth: 180 }}
+          placeholder={translate('modelSearch')}
+          value={query}
+          disabled={busy}
+          onChange={event => { setQuery(event.target.value) }}
+        />
+        <span style={{ display: 'inline-flex', gap: 8 }}>
+          <button
+            type="button"
+            style={{ ...buttonStyle, minHeight: 30, padding: '4px 10px', borderRadius: 8, fontSize: 13 }}
+            disabled={busy || allOn}
+            onClick={() => { void write([]) }}
+          >
+            {translate('showAll')}
+          </button>
+          <button
+            type="button"
+            style={{ ...buttonStyle, minHeight: 30, padding: '4px 10px', borderRadius: 8, fontSize: 13 }}
+            disabled={busy || hiddenIds.length === switches.length}
+            onClick={() => { void write(switches.map(entry => entry.id)) }}
+          >
+            {translate('hideAll')}
+          </button>
+        </span>
+      </div>
+      {shown.length === 0 ? (
+        <span style={{ color: 'var(--dsw-alias-label-tertiary)', fontSize: 12 }}>{translate('noModelMatch')}</span>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {shown.map(entry => (
+            <div key={entry.id} style={rowStyle}>
+              <span style={{ color: 'var(--dsw-alias-label-secondary)', fontSize: 13 }}>{entry.name}</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={entry.on}
+                style={{ ...buttonStyle, minHeight: 28, padding: '3px 12px', borderRadius: 999, fontSize: 12, minWidth: 70 }}
+                disabled={busy}
+                onClick={() => { void toggle(entry.id) }}
+              >
+                {entry.on ? translate('switchOn') : translate('switchOff')}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <span style={{ color: 'var(--dsw-alias-label-tertiary)', fontSize: 12, maxWidth: 420 }}>
+        {translate('modelSwitchesHint')}
+      </span>
       {note !== undefined ? <p style={{ ...bodyStyle, fontSize: 13 }}>{note}</p> : null}
       {failure !== undefined ? <p style={errorStyle}>{failure}</p> : null}
     </div>

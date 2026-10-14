@@ -58,9 +58,22 @@ export interface QoderShim {
 
 /** Constructor dependencies. */
 export interface QoderShimOptions {
-  /** Qoder CLI overrides (command, PAT, home dir); env vars still apply. */
-  qoder?: QoderOptions
+  /**
+   * Qoder CLI overrides (command, PAT, home dir); env vars still apply.
+   *
+   * A thunk is read once per request rather than snapshotted at construction,
+   * so a setting edited on the card reaches the next chat run without a
+   * restart. A plain object is still accepted and behaves as a constant.
+   */
+  qoder?: QoderOptions | (() => QoderOptions)
   logger?: ShimLogger
+}
+
+/** Normalize the qoder options, resolving a live thunk when one was given. */
+function qoderOptionsOf(options: QoderShimOptions): QoderOptions {
+  const qoder = options.qoder
+  if (typeof qoder === 'function') return qoder()
+  return qoder ?? {}
 }
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
@@ -107,6 +120,8 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
  */
 export function createQoderShim(options: QoderShimOptions = {}): QoderShim {
   const logger = options.logger
+  /** The qoder options for this moment; a thunk is re-read per request. */
+  const qoderOptions = (): QoderOptions => qoderOptionsOf(options)
 
   // Per-process shared secret. Lives only in memory; the adapter resolves it
   // as the OpenAI apiKey, which pi-ai sends as `Authorization: Bearer ...`.
@@ -172,7 +187,7 @@ export function createQoderShim(options: QoderShimOptions = {}): QoderShim {
       if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/')) {
         // Readiness is re-checked per read: a CLI installed or a login that
         // happened after startup must not leave a stale 401 (or a stale 200).
-        const status = qoderStatus(options.qoder)
+        const status = qoderStatus(qoderOptions())
         if (!status.ready) {
           writeOpenAIError(res, 401, 'qoder_not_ready', status.reason)
           return
@@ -199,7 +214,7 @@ export function createQoderShim(options: QoderShimOptions = {}): QoderShim {
       writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type must be application/json')
       return
     }
-    const status: QoderStatus = qoderStatus(options.qoder)
+    const status: QoderStatus = qoderStatus(qoderOptions())
     if (!status.ready) {
       writeOpenAIError(res, 401, 'qoder_not_ready', status.reason)
       return
@@ -241,7 +256,7 @@ export function createQoderShim(options: QoderShimOptions = {}): QoderShim {
       }
       const chunks: ChatChunk[] = []
       for await (const chunk of qoderChatStream(body, {
-        ...options.qoder,
+        ...qoderOptions(),
         signal: controller.signal,
         timeoutMs,
         onRunComplete: (result: QoderRunResult, cliModel: string) => {

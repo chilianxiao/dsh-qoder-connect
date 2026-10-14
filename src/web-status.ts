@@ -21,10 +21,10 @@ import {
 } from './qoder.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { QODER_CONFIG_PATH, QODER_STATUS_PATH } from './status-paths.ts'
-import type { QoderWebModel, QoderWebReasoning, QoderWebStatus } from './status-paths.ts'
+import type { QoderWebContextWindow, QoderWebModel, QoderWebModelSwitch, QoderWebReasoning, QoderWebStatus } from './status-paths.ts'
 
 export { QODER_STATUS_PATH, QODER_CONFIG_PATH } from './status-paths.ts'
-export type { QoderRosterSource, QoderWebReasoning, QoderWebStatus } from './status-paths.ts'
+export type { QoderRosterSource, QoderWebContextWindow, QoderWebModel, QoderWebModelSwitch, QoderWebReasoning, QoderWebStatus } from './status-paths.ts'
 
 /** Constructor dependencies. */
 export interface QoderStatusRouteOptions {
@@ -76,6 +76,17 @@ export function qoderWebReasoning(qoder: QoderOptions = {}): QoderWebReasoning {
 }
 
 /**
+ * The context-window switch as the card renders it.
+ *
+ * Read off the live options rather than from a stored setting, so the card
+ * shows what is actually in effect for the next request — including a value
+ * edited elsewhere while the card was open.
+ */
+export function qoderWebContextWindow(qoder: QoderOptions = {}): QoderWebContextWindow {
+  return { max: qoder.contextWindowMax === true }
+}
+
+/**
  * The request must be addressed to the loopback interface, and a
  * browser-attached Origin must be loopback too. The Host check drops
  * DNS-rebinding pages (their Host is the attacker's domain, not loopback);
@@ -92,7 +103,13 @@ function loopbackRequest(req: IncomingMessage): boolean {
 export function qoderWebStatus(deps: QoderStatusRouteOptions): QoderWebStatus {
   const status = qoderStatus(deps.qoder)
   const models: readonly QoderWebModel[] = deps.catalog.current().map(entry => ({ id: entry.id, name: entry.name }))
+  // The switches cover the whole roster, not just what is served: a model
+  // switched off still has to be reachable from the card, or it could never
+  // be switched back on.
+  const switches: readonly QoderWebModelSwitch[] = deps.catalog.withVisibility()
+    .map(entry => ({ id: entry.id, name: entry.name, on: entry.on }))
   const reasoning = qoderWebReasoning(deps.qoder)
+  const contextWindow = qoderWebContextWindow(deps.qoder)
   const rosterSource = deps.catalog.source()
   if (!status.ready) {
     return {
@@ -103,6 +120,8 @@ export function qoderWebStatus(deps: QoderStatusRouteOptions): QoderWebStatus {
       pat: status.pat,
       oauthFile: status.oauthFile,
       reasoning,
+      contextWindow,
+      switches,
       rosterSource,
     }
   }
@@ -113,7 +132,9 @@ export function qoderWebStatus(deps: QoderStatusRouteOptions): QoderWebStatus {
     oauthFile: status.oauthFile,
     reason: status.reason,
     models,
+    switches,
     reasoning,
+    contextWindow,
     rosterSource,
   }
 }
@@ -156,11 +177,13 @@ export function registerQoderStatusRoute(ctx: Context, deps: QoderStatusRouteOpt
 /** Body ceiling for the config write route: three small scalars. */
 const CONFIG_BODY_LIMIT = 4 * 1024
 
-/** One validated reasoning-control write. */
-interface ReasoningPatch {
+/** One validated settings write from the card. */
+interface QoderConfigPatch {
   reasoningEffort?: string
   thinking?: string
   thinkingBudget?: number
+  contextWindowMax?: boolean
+  hiddenModels?: string[]
 }
 
 /**
@@ -170,13 +193,17 @@ interface ReasoningPatch {
  * must be refused at the edge rather than persisted and then replayed into
  * every later request. `''` is accepted for the two selects and means "do not
  * send this flag"; the empty string cannot reach the schema as a valid level.
+ *
+ * `contextWindowMax` is a plain boolean — the number it stands for is a
+ * per-model fact read from the official catalog at request time, so there is
+ * nothing here for a caller to get wrong.
  */
-export function parseReasoningPatch(body: unknown): { patch: ReasoningPatch } | { error: string } {
+export function parseQoderConfigPatch(body: unknown): { patch: QoderConfigPatch } | { error: string } {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     return { error: 'body must be a JSON object' }
   }
   const raw = body as Record<string, unknown>
-  const patch: ReasoningPatch = {}
+  const patch: QoderConfigPatch = {}
 
   if ('reasoningEffort' in raw) {
     const value = raw.reasoningEffort
@@ -212,8 +239,36 @@ export function parseReasoningPatch(body: unknown): { patch: ReasoningPatch } | 
     }
   }
 
+  if ('contextWindowMax' in raw) {
+    const value = raw.contextWindowMax
+    if (typeof value !== 'boolean') {
+      return { error: 'contextWindowMax must be a boolean' }
+    }
+    patch.contextWindowMax = value
+  }
+
+  if ('hiddenModels' in raw) {
+    const value = raw.hiddenModels
+    if (!Array.isArray(value) || value.some(entry => typeof entry !== 'string')) {
+      return { error: 'hiddenModels must be an array of model id strings' }
+    }
+    // Deduplicated: the same id twice would only ever mean "hidden", and a
+    // duplicate would make the stored array differ from the effective set for
+    // no reason the card could explain.
+    patch.hiddenModels = [...new Set(value as string[])]
+  }
+
   return { patch }
 }
+
+/**
+ * Backwards-compatible alias for {@link parseQoderConfigPatch}.
+ *
+ * The route outgrew its original name when the context-window switch joined
+ * the reasoning controls, but the reasoning spelling is what the existing
+ * call sites and tests use, so it stays available.
+ */
+export const parseReasoningPatch = parseQoderConfigPatch
 
 /** Read a request body with a size cap. */
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -287,7 +342,7 @@ export function qoderConfigHandler(
         json(res, 501, { error: 'settings are not available in this profile' })
         return
       }
-      const parsed = parseReasoningPatch(body)
+      const parsed = parseQoderConfigPatch(body)
       if ('error' in parsed) {
         json(res, 400, { error: parsed.error })
         return

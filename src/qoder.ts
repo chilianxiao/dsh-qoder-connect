@@ -18,6 +18,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { disposeImageAttachments, materializeImageAttachments } from './images.ts'
 
 /** One model the qoder provider exposes: the DSH-facing id and the CLI spelling. */
 export interface QoderModel {
@@ -152,6 +153,27 @@ export interface QoderOptions {
   thinkingBudget?: number
   /** Home directory to probe; defaults to `os.homedir()`. */
   homeDir?: string
+  /**
+   * Serve models at the largest context window the official catalog declares
+   * for them (`--context-window`) instead of the window the official client
+   * picks by default. Recorded here so the status card can show what is in
+   * effect; the value itself comes from {@link QoderOptions.resolveContextWindow}.
+   */
+  contextWindowMax?: boolean
+  /**
+   * Resolve the explicit `--context-window` value for one CLI model name.
+   *
+   * A resolver rather than a number because the window is a per-model fact:
+   * the official catalog lists several windows per model (typically 200K /
+   * 400K / 1M) and only the caller holding that catalog knows which are real.
+   * Returning undefined omits the flag, which leaves the CLI's own configured
+   * default in place.
+   *
+   * The value is passed through unvalidated on purpose: the CLI accepts any
+   * number without complaint (verified — `--context-window 999` runs), so
+   * guarding has to happen where the catalog is known, not here.
+   */
+  resolveContextWindow?: (cliModel: string) => number | undefined
   /** Abort signal for one chat run. */
   signal?: AbortSignal
   /**
@@ -760,12 +782,31 @@ export async function* qoderChatStream(body: unknown, options: QoderOptions = {}
     ? wireEffort as QoderReasoningEffort
     : options.reasoningEffort
   const { system, prompt } = buildCliPrompt(requestBody.messages)
+
+  // Images ride beside the prompt as `--attachment` paths rather than inside
+  // it. Materializing is async and can fail per image, so it happens before
+  // the CLI is spawned and is always disposed of in the finally below — a run
+  // that dies mid-stream must not leak its temp files.
+  const images = await materializeImageAttachments(requestBody.messages)
+
+  // The explicit context window, when the caller resolved one for this model.
+  // Placed with the other per-model flags so the CLI sees a coherent request.
+  const contextWindow = options.resolveContextWindow?.(model)
+  const contextWindowArgs = typeof contextWindow === 'number'
+    && Number.isFinite(contextWindow)
+    && contextWindow > 0
+    && Number.isInteger(contextWindow)
+    ? ['--context-window', String(contextWindow)]
+    : []
+
   const args = [
     '--print',
     '--output-format', 'stream-json',
     '--model', model,
     ...buildReasoningArgs({ ...options, reasoningEffort }),
     '--dangerously-skip-permissions',
+    ...contextWindowArgs,
+    ...images.paths.flatMap(file => ['--attachment', file]),
     ...(system !== '' ? ['--append-system-prompt', system] : []),
     '--',
     prompt,
@@ -885,6 +926,9 @@ export async function* qoderChatStream(body: unknown, options: QoderOptions = {}
     if (signal !== undefined) signal.removeEventListener('abort', onAbort)
     if (timer !== null) clearTimeout(timer)
     killCli(child, resolved.viaCmd)
+    // The run's scratch images go with it. Fire-and-forget: a failed cleanup
+    // costs temp space, never the chat that already finished.
+    void disposeImageAttachments(images.paths)
     // Exactly one completion report per run: the CLI's own summary when it
     // produced one, otherwise a zero-credit error marker. Aborts, timeouts
     // and non-zero exits all land here with `isError` set, so the ledger

@@ -29,7 +29,19 @@ export interface QoderSettingsCopy {
   saved: string
   reset: string
   rosterCli: string
+  rosterSaved: string
   rosterBuiltin: string
+  contextWindow: string
+  contextWindowMax: string
+  contextWindowHint: string
+  switchOn: string
+  switchOff: string
+  modelSwitches: string
+  modelSwitchesHint: string
+  modelSearch: string
+  showAll: string
+  hideAll: string
+  noModelMatch: string
   refreshModels: string
   refreshingModels: string
 }
@@ -66,7 +78,19 @@ export const zh: QoderSettingsCopy = {
   saved: '已保存',
   reset: '恢复默认',
   rosterCli: '来自 qoderclicn --list-models（Qoder 新增模型会自动出现）',
+  rosterSaved: '上次成功拉取的列表已保存到本机（本次 CLI 未响应，重启后不会退回内置列表）',
   rosterBuiltin: '内置列表（未能从 CLI 拉取，Qoder 新加的模型可能不在此列）',
+  contextWindow: '上下文窗口',
+  contextWindowMax: '使用上游声明的最大窗口',
+  contextWindowHint: '开启后按各模型声明的最大窗口请求（如 1M），关闭则用官方客户端默认的窗口（通常 200K）。数值取自官方目录，只在其声明的档位间切换。',
+  switchOn: '已开启',
+  switchOff: '已关闭',
+  modelSwitches: '模型开关',
+  modelSwitchesHint: '关闭的模型不会出现在模型选择器里。列表来自 CLI 拉取结果，Qoder 新增的模型默认开启。',
+  modelSearch: '搜索模型',
+  showAll: '全部开启',
+  hideAll: '全部关闭',
+  noModelMatch: '没有匹配的模型',
   refreshModels: '重新拉取模型',
   refreshingModels: '拉取中…',
 }
@@ -100,7 +124,19 @@ export const en: QoderSettingsCopy = {
   saved: 'Saved',
   reset: 'Reset to default',
   rosterCli: 'From qoderclicn --list-models (models Qoder adds appear automatically)',
+  rosterSaved: 'Saved from the last successful fetch on this machine (the CLI did not answer this time, so a restart will not fall back to the built-in list)',
   rosterBuiltin: 'Built-in list (could not read the CLI, so newly added models may be missing)',
+  contextWindow: 'Context window',
+  contextWindowMax: 'Use the upstream-declared maximum',
+  contextWindowHint: 'On requests the largest window each model declares (e.g. 1M); off uses the window the official client picks by default (usually 200K). The number always comes from the official catalog, so only declared tiers are ever sent.',
+  switchOn: 'On',
+  switchOff: 'Off',
+  modelSwitches: 'Model switches',
+  modelSwitchesHint: 'A switched-off model never appears in the model picker. The list comes from the CLI, so a model Qoder adds later starts switched on.',
+  modelSearch: 'Search models',
+  showAll: 'Show all',
+  hideAll: 'Hide all',
+  noModelMatch: 'No matching models',
   refreshModels: 'Re-fetch models',
   refreshingModels: 'Fetching…',
 }

@@ -40,6 +40,8 @@ import {
   qoderOauthUserPath,
   qoderStatus,
   parseCatalogDocument,
+  parseQoderConfigPatch,
+  qoderWebStatus,
 } from '../lib/index.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -588,6 +590,195 @@ test('adapter models declare exactly the levels the official catalog grants', as
   assert.equal(onOffOnly.reasoning, undefined)
 })
 
+test('a model the catalog marks is_vl is advertised as image-capable', async () => {
+  // The CLI accepts `--attachment <file>`, so `is_vl` — the upstream model
+  // accepting images — is now a capability this surface really has. Only the
+  // catalog's own word is trusted: a model it does not mark stays text-only.
+  const doc = JSON.stringify({
+    chat: [
+      {
+        key: 'qmodel_38max',
+        display_name: 'Qwen3.8-Max',
+        price_factor: 0.2,
+        is_vl: true,
+        context_config: { '200K': { token_count: 200000, is_default: true } },
+        thinking_config: { enabled: { is_default: true, efforts: { low: {}, medium: { is_default: true }, xhigh: {} } } },
+      },
+      { key: 'mmodel', display_name: 'MiniMax-M2.7', price_factor: 0.2 },
+    ],
+  })
+  const facts = parseCatalogDocument(doc)
+  const { adapter } = createQoderAdapter({
+    shim: { baseUrl: () => 'http://127.0.0.1:1', token: () => 'secret' },
+    catalog: {
+      current: () => [
+        { id: 'qoder-qwen3.8-max', name: 'Qwen3.8-Max' },
+        { id: 'qoder-minimax-m2.7', name: 'MiniMax-M2.7' },
+      ],
+    },
+    modelFacts: () => facts,
+  })
+
+  const withImages = await adapter.resolveModel('qoder', 'qoder-qwen3.8-max')
+  assert.deepEqual(withImages.inputModalities, ['text', 'image'])
+
+  // Not marked by the catalog: under-claim, so the client refuses the image
+  // instead of the turn failing halfway through.
+  const textOnly = await adapter.resolveModel('qoder', 'qoder-minimax-m2.7')
+  assert.deepEqual(textOnly.inputModalities, ['text'])
+})
+
+test('an unreadable catalog leaves every model text-only', async () => {
+  // Without facts nothing may be guessed: the image capability rides on the
+  // catalog's `is_vl`, and its absence means "unknown", not "no".
+  const { adapter } = createQoderAdapter({
+    shim: { baseUrl: () => 'http://127.0.0.1:1', token: () => 'secret' },
+    catalog: { current: () => QODER_MODELS.map(m => ({ id: m.externalId, name: m.cliModel })) },
+  })
+  for (const model of QODER_MODELS) {
+    const info = await adapter.resolveModel('qoder', model.externalId)
+    assert.deepEqual(info.inputModalities, ['text'], `${model.externalId} must not claim images without facts`)
+  }
+})
+
+test('the max context-window switch takes the largest window the catalog declares', async () => {
+  // The catalog is the only source of the number: the CLI accepts any
+  // `--context-window` without complaint, so a computed value would be a
+  // fiction the upstream never agreed to.
+  const doc = JSON.stringify({
+    chat: [{
+      key: 'qmodel_38max',
+      display_name: 'Qwen3.8-Max',
+      price_factor: 0.2,
+      is_vl: true,
+      context_config: {
+        '200K': { token_count: 200000, is_default: true },
+        '400K': { token_count: 400000 },
+        '1M': { token_count: 1000000 },
+      },
+    }],
+  })
+  const facts = parseCatalogDocument(doc)
+  const catalog = { current: () => [{ id: 'qoder-qwen3.8-max', name: 'Qwen3.8-Max' }] }
+  const shim = { baseUrl: () => 'http://127.0.0.1:1', token: () => 'secret' }
+
+  const atDefault = await createQoderAdapter({ shim, catalog, modelFacts: () => facts })
+    .adapter.resolveModel('qoder', 'qoder-qwen3.8-max')
+  assert.equal(atDefault.context.contextWindow, 200000, 'the default tier is the client\'s own window')
+
+  const atMax = await createQoderAdapter({ shim, catalog, modelFacts: () => facts, contextWindowMode: () => 'max' })
+    .adapter.resolveModel('qoder', 'qoder-qwen3.8-max')
+  assert.equal(atMax.context.contextWindow, 1000000, 'the max tier is the largest declared window')
+})
+
+test('the max switch falls back to the default window when the catalog declares only one', async () => {
+  // A single-window model has no maximum to take, so the switch must be a
+  // no-op rather than inventing a bigger number.
+  const doc = JSON.stringify({
+    chat: [{
+      key: 'qmodel_auto',
+      display_name: 'Auto',
+      price_factor: 0.5,
+      context_config: { '200K': { token_count: 200000, is_default: true } },
+    }],
+  })
+  const facts = parseCatalogDocument(doc)
+  const info = await createQoderAdapter({
+    shim: { baseUrl: () => 'http://127.0.0.1:1', token: () => 'secret' },
+    catalog: { current: () => [{ id: 'qoder-auto', name: 'Auto' }] },
+    modelFacts: () => facts,
+    contextWindowMode: () => 'max',
+  }).adapter.resolveModel('qoder', 'qoder-auto')
+  assert.equal(info.context.contextWindow, 200000)
+})
+
+test('the max switch leaves an unknown model on the conservative default', async () => {
+  const info = await createQoderAdapter({
+    shim: { baseUrl: () => 'http://127.0.0.1:1', token: () => 'secret' },
+    catalog: { current: () => [{ id: 'qoder-qwen3.7-max', name: 'Qwen3.7-Max' }] },
+    contextWindowMode: () => 'max',
+  }).adapter.resolveModel('qoder', 'qoder-qwen3.7-max')
+  assert.equal(info.context.contextWindow, 262144)
+})
+
+test('the explicit context window reaches the CLI only when one was resolved', async () => {
+  // Two runs against the stub: one with a resolver, one without. Only the
+  // first may carry the flag, and the value must be the resolved one.
+  const echo = path.join(os.tmpdir(), `dsh-qoder-ctx-${Date.now()}.json`)
+  const previous = process.env.QODER_STUB_ECHO
+  process.env.QODER_STUB_ECHO = echo
+  try {
+    for await (const _chunk of qoderChatStream(
+      { model: 'qoder-qwen3.7-max', messages: [{ role: 'user', content: 'hi' }] },
+      { ...stubOptions(), resolveContextWindow: () => 1000000 },
+    )) {
+      // Drain the stream.
+    }
+    const withFlag = JSON.parse(fs.readFileSync(echo, 'utf8'))
+    assert.ok(withFlag.includes('--context-window'))
+    assert.equal(withFlag[withFlag.indexOf('--context-window') + 1], '1000000')
+
+    for await (const _chunk of qoderChatStream(
+      { model: 'qoder-qwen3.7-max', messages: [{ role: 'user', content: 'hi' }] },
+      stubOptions(),
+    )) {
+      // Drain the stream.
+    }
+    const without = JSON.parse(fs.readFileSync(echo, 'utf8'))
+    assert.equal(without.includes('--context-window'), false)
+  } finally {
+    if (previous === undefined) delete process.env.QODER_STUB_ECHO
+    else process.env.QODER_STUB_ECHO = previous
+    fs.rmSync(echo, { force: true })
+  }
+})
+
+test('a context window the resolver declines is not sent', async () => {
+  // Undefined means "leave the CLI's own default alone", which is the
+  // default mode's whole behaviour.
+  const echo = path.join(os.tmpdir(), `dsh-qoder-ctx-none-${Date.now()}.json`)
+  const previous = process.env.QODER_STUB_ECHO
+  process.env.QODER_STUB_ECHO = echo
+  try {
+    for await (const _chunk of qoderChatStream(
+      { model: 'qoder-qwen3.7-max', messages: [{ role: 'user', content: 'hi' }] },
+      { ...stubOptions(), resolveContextWindow: () => undefined },
+    )) {
+      // Drain the stream.
+    }
+    const argv = JSON.parse(fs.readFileSync(echo, 'utf8'))
+    assert.equal(argv.includes('--context-window'), false)
+  } finally {
+    if (previous === undefined) delete process.env.QODER_STUB_ECHO
+    else process.env.QODER_STUB_ECHO = previous
+    fs.rmSync(echo, { force: true })
+  }
+})
+
+test('a non-integer or non-positive context window is refused before argv', async () => {
+  // The CLI does not validate this flag, so the guard has to live here: a
+  // fractional or negative value would otherwise reach the command line.
+  const echo = path.join(os.tmpdir(), `dsh-qoder-ctx-bad-${Date.now()}.json`)
+  const previous = process.env.QODER_STUB_ECHO
+  process.env.QODER_STUB_ECHO = echo
+  try {
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      for await (const _chunk of qoderChatStream(
+        { model: 'qoder-qwen3.7-max', messages: [{ role: 'user', content: 'hi' }] },
+        { ...stubOptions(), resolveContextWindow: () => bad },
+      )) {
+        // Drain the stream.
+      }
+      const argv = JSON.parse(fs.readFileSync(echo, 'utf8'))
+      assert.equal(argv.includes('--context-window'), false, `${bad} must not become a flag`)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.QODER_STUB_ECHO
+    else process.env.QODER_STUB_ECHO = previous
+    fs.rmSync(echo, { force: true })
+  }
+})
+
 test('parseReasoningPatch accepts the CLI vocabularies and rejects anything else', () => {
   assert.deepEqual(parseReasoningPatch({ reasoningEffort: 'high' }), { patch: { reasoningEffort: 'high' } })
   assert.deepEqual(parseReasoningPatch({ thinking: 'disabled' }), { patch: { thinking: 'disabled' } })
@@ -606,6 +797,40 @@ test('parseReasoningPatch accepts the CLI vocabularies and rejects anything else
   assert.ok('error' in parseReasoningPatch({ thinkingBudget: 99_999_999 }))
   assert.ok('error' in parseReasoningPatch([]))
   assert.ok('error' in parseReasoningPatch('nope'))
+})
+
+test('parseQoderConfigPatch carries the context-window switch', () => {
+  // The switch is a boolean and nothing else: the number it stands for is a
+  // per-model catalog fact resolved at request time, so there is no value
+  // here for a caller to get wrong.
+  assert.deepEqual(parseQoderConfigPatch({ contextWindowMax: true }), { patch: { contextWindowMax: true } })
+  assert.deepEqual(parseQoderConfigPatch({ contextWindowMax: false }), { patch: { contextWindowMax: false } })
+  // It rides alongside the reasoning fields in one patch, as the card sends it.
+  assert.deepEqual(
+    parseQoderConfigPatch({ reasoningEffort: 'high', contextWindowMax: true }),
+    { patch: { reasoningEffort: 'high', contextWindowMax: true } },
+  )
+  // A non-boolean is refused rather than coerced: `1` would otherwise become
+  // a truthy switch nobody asked for.
+  assert.ok('error' in parseQoderConfigPatch({ contextWindowMax: 1 }))
+  assert.ok('error' in parseQoderConfigPatch({ contextWindowMax: 'true' }))
+  assert.ok('error' in parseQoderConfigPatch({ contextWindowMax: null }))
+  // The old name still parses everything the new one does.
+  assert.deepEqual(parseReasoningPatch({ contextWindowMax: true }), { patch: { contextWindowMax: true } })
+})
+
+test('the status document carries the context-window switch in effect', async () => {
+  // The card renders what the next request will actually use, so the switch
+  // has to be readable off the live options — including a value edited
+  // elsewhere while the card was open.
+  const catalog = new QoderCatalog()
+  catalog.setVisible(true)
+  const base = { command: process.execPath, prefixArgs: [STUB], homeDir: tempHome(true) }
+  const off = qoderWebStatus({ catalog, qoder: base })
+  assert.equal(off.contextWindow.max, false)
+
+  const on = qoderWebStatus({ catalog, qoder: { ...base, contextWindowMax: true } })
+  assert.equal(on.contextWindow.max, true)
 })
 
 test('parseListModelsOutput reads the CLI table and derives stable ids', () => {
