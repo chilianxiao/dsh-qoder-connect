@@ -291,18 +291,30 @@ test('the settings page policy opts out of the auto-generated page', async () =>
 })
 
 test('the provider directory entry joins the settings namespace', async () => {
-  // The Models settings page finds a provider's namespace through this entry,
-  // and the namespace is the profile entry id — not the provider id. Mixing
-  // the two up is what produced `No configurable plugin entry "qoder"`.
+  // The Models settings page finds a provider's namespace through this entry
+  // (`namespaces.find(ns => ns.ns === provider.settingsNs)`), so the value has
+  // to be the loader entry id — the `id` the bundle patch declares, not the
+  // provider id and not the package name.
   const { ctx, calls, disposeAll } = mockContext()
   try {
     apply(ctx, {})
     assert.ok(await waitFor(() => calls.providers.length === 1))
     assert.equal(calls.providers[0][0].settingsNs, QODER_SETTINGS_NS)
-    assert.equal(QODER_SETTINGS_NS, 'dsh-qoder-connect')
+    assert.equal(QODER_SETTINGS_NS, 'llm-qoder')
   } finally {
     disposeAll()
   }
+})
+
+test('the settings namespace matches the id this package patches in', async () => {
+  // The pin that would have caught both wrong answers. Patching the package in
+  // under a *different* id silently breaks every card save, because the two
+  // spellings never meet anywhere else: the id lives in cordis.patch.yml and
+  // the namespace lives in this module.
+  const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/(?=[A-Za-z]:)/, ''))
+  const patch = fs.readFileSync(path.join(here, '..', 'cordis.patch.yml'), 'utf8')
+  const declared = [...patch.matchAll(/^\s*-\s*id:\s*(\S+)\s*$/gm)].map(match => match[1])
+  assert.deepEqual(declared, [QODER_SETTINGS_NS])
 })
 
 test('plugin disposal closes the loopback shim', async () => {

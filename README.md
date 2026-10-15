@@ -164,9 +164,9 @@ dsh plugin --profile web add link:D:/dsh_web/plugins/qoder-connect
 | 设置项 `contextWindowMax` | `false` | 按官方目录声明的最大上下文窗口请求（`--context-window`） |
 | 设置项 `hiddenModels` | `[]` | 要从模型选择器隐藏的模型 id 列表 |
 
-推理三项都在设置卡片的「推理设置」区编辑，写入插件自己的 `dsh-qoder-connect` 设置命名空间因而持久化；留空表示不下发该参数，跟随 CLI 自身默认。它们是**全局兜底**：模型选择器里选的档位优先于 `reasoningEffort`。取值按 CLI 1.1.59 实测的可选列表校验——**非法值会被 CLI 直接判为致命错误并终止本次请求**（`Invalid reasoning effort: ...`），所以写入前在插件侧就拒掉。
+推理三项都在设置卡片的「推理设置」区编辑，写入插件自己的 `llm-qoder` 设置命名空间因而持久化；留空表示不下发该参数，跟随 CLI 自身默认。它们是**全局兜底**：模型选择器里选的档位优先于 `reasoningEffort`。取值按 CLI 1.1.59 实测的可选列表校验——**非法值会被 CLI 直接判为致命错误并终止本次请求**（`Invalid reasoning effort: ...`），所以写入前在插件侧就拒掉。
 
-命名空间写的是 **profile entry id**（包名 `dsh-qoder-connect`），不是模型 provider id（`qoder`）：DSH 的设置服务按 `entry.options.id` 解析命名空间，写错会得到 `No configurable plugin entry "qoder"` 而不是静默失败。卡片可编辑的字段全部声明为 `volatile()`——普通配置变更会重挂插件（loopback shim、模型目录、就绪轮询全部重建），volatile 变更则由 loader 原地提交，改完下一次请求即生效、无需重启。
+命名空间写的是 **loader entry id**（`cordis.patch.yml` 里声明的 `llm-qoder`），既不是模型 provider id（`qoder`）也不是包名（`dsh-qoder-connect`）：DSH 的设置服务按 `entry.options.id` 解析命名空间，而该 id 来自 profile 的 patch 行。三个名字是同一个插件的三个不同键，写错会得到 `No configurable plugin entry "..."` 而不是静默失败。最容易踩的是客户端 `plugins.item` 插槽——它也暴露一个 `entry.options.id`，但那属于浏览器 slot 注册表、取值是包名，两者无关。卡片可编辑的字段全部声明为 `volatile()`——普通配置变更会重挂插件（loopback shim、模型目录、就绪轮询全部重建），volatile 变更则由 loader 原地提交，改完下一次请求即生效、无需重启。
 
 PAT 只从环境变量读取、不落盘到 settings——有落盘登录态时插件还会主动把它从子进程环境里移除，避免 CLI 用它覆盖已保存登录。
 

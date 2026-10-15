@@ -1020,18 +1020,27 @@ declare const inject: string[];
 /**
  * Settings namespace this plugin's card writes through.
  *
- * It is the **profile entry id** — the package name as it appears in the
- * profile's `dependencies` and `dsh.profile.bundles` — not the model provider
- * id. DSH's settings service resolves a namespace by matching
- * `entry.options.id` (`dsh-settings` `SettingsForms.write`), and an entry id
- * is the bundle's package name, so the two are different keys that happen to
- * describe the same plugin.
+ * It is the **loader entry id** — the `id` this plugin's bundle patch
+ * declares in `cordis.patch.yml` (`llm-qoder`) — not the model provider id
+ * (`qoder`) and not the package name (`dsh-qoder-connect`).
  *
- * Getting this wrong is not a silent no-op: the write throws
+ * DSH resolves a namespace by matching `entry.options.id` in
+ * `SettingsForms.write`, and those entries come from `loader.entries()`, whose
+ * ids are the profile patch ids. The three names are genuinely different keys
+ * for the same plugin:
+ *
+ * - `qoder` — the model provider, for `llm.registerAdapter`;
+ * - `llm-qoder` — the loader entry, for settings;
+ * - `dsh-qoder-connect` — the npm package, for the client `plugins.item` slot.
+ *
+ * The client slot is the trap: it also exposes an `entry.options.id`, but that
+ * one belongs to the browser slot registry, where the id is the package name.
+ * The two `options.id`s are unrelated, so carrying the slot's answer here
+ * fails — which is exactly how this was got wrong once.
+ *
+ * Getting it wrong is not a silent no-op: the write throws
  * `No configurable plugin entry "<ns>"`, which surfaces on the card as a
- * failed save with no hint that the namespace was the problem. The provider
- * id (`qoder`) is the right answer for `llm.registerAdapter` and the wrong
- * one here.
+ * failed save with no hint that the namespace was the problem.
  */
 declare const QODER_SETTINGS_NS: SettingsNamespace;
 /**
