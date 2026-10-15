@@ -64,7 +64,7 @@ dsh plugin --profile web add link:D:/dsh_web/plugins/qoder-connect
 
 After installing, add `dsh-qoder-connect` to the profile's `dsh.profile.bundles` list in its `package.json` (`dsh plugin add` only runs pnpm; the bundles list is maintained by hand), then start or restart the interface.
 
-Version compatibility: the plugin targets the DSH `0.1.6-alpha.2` API surface (`dsh-llm-pi-ai` profile fields, the `plugins.item` client slot). Earlier DSH cores are untested.
+Version compatibility: the plugin targets the DSH `0.1.6-alpha.2` API surface (`dsh-llm-pi-ai` profile fields, the `plugins.item` client slot). The settings card additionally needs the DSH 0.1.7 settings API (`configure` plus volatile fields): on 0.1.6 the card still renders but a save fails. Earlier DSH cores are untested.
 
 ## Configuration
 

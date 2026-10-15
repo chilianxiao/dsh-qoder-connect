@@ -109,8 +109,23 @@ export const name = 'llm-qoder'
 /** The model registry required before the provider can register. */
 export const inject = ['llm']
 
-/** Settings namespace owning the plugin card's section. */
-export const QODER_SETTINGS_NS = 'qoder' as SettingsNamespace
+/**
+ * Settings namespace this plugin's card writes through.
+ *
+ * It is the **profile entry id** — the package name as it appears in the
+ * profile's `dependencies` and `dsh.profile.bundles` — not the model provider
+ * id. DSH's settings service resolves a namespace by matching
+ * `entry.options.id` (`dsh-settings` `SettingsForms.write`), and an entry id
+ * is the bundle's package name, so the two are different keys that happen to
+ * describe the same plugin.
+ *
+ * Getting this wrong is not a silent no-op: the write throws
+ * `No configurable plugin entry "<ns>"`, which surfaces on the card as a
+ * failed save with no hint that the namespace was the problem. The provider
+ * id (`qoder`) is the right answer for `llm.registerAdapter` and the wrong
+ * one here.
+ */
+export const QODER_SETTINGS_NS = 'dsh-qoder-connect' as SettingsNamespace
 
 /**
  * How often readiness is re-checked, in milliseconds.
@@ -140,6 +155,20 @@ function readinessPollMs(): number {
   const override = Number(process.env['DSH_QODER_POLL_MS'])
   if (!Number.isFinite(override) || override < MIN_POLL_MS) return READINESS_POLL_MS
   return Math.min(override, MAX_POLL_MS)
+}
+
+/**
+ * A `Volatile` reference as schemastery hands it to a plugin.
+ *
+ * A schema field marked `volatile()` validates to one of these instead of a
+ * plain value, so that the loader can commit an edit in place rather than
+ * remounting the plugin. The getter is typed loosely on purpose: cosmokit's
+ * `Volatile<T>` reports a readonly view of `T`, which does not line up with
+ * the mutable `T` this plugin stores, and the only thing done with the result
+ * is read it.
+ */
+interface VolatileRef {
+  get(): unknown
 }
 
 /** Plugin configuration. */
@@ -183,23 +212,37 @@ export interface Config {
   hiddenModels?: string[]
 }
 
+/**
+ * The config as the host hands it to `apply()`.
+ *
+ * Identical to {@link Config} except that every field may arrive as a
+ * `Volatile` ref rather than a plain value, because each schema field is
+ * marked `volatile()` so the host can commit a card edit in place instead of
+ * remounting the plugin. {@link readConfig} is the one place that resolves
+ * them; everything downstream of it sees plain {@link Config}.
+ */
+export type AppliedConfig = {
+  [K in keyof Config]: Config[K] | VolatileRef | undefined
+}
+
 /** Explicit CLI override (shared by the plugin schema and its section). */
-const CLI_FIELD = z.string().description('Qoder CLI command or path (defaults to QODERCN_CLI, then qoderclicn)')
+const CLI_FIELD = z.string().volatile()
+  .description('Qoder CLI command or path (defaults to QODERCN_CLI, then qoderclicn)')
 
 /**
  * Reasoning-effort selector. The union keeps the settings file honest: an
  * unknown level can never be persisted, which matters because the CLI exits
  * fatally on one instead of ignoring it.
  */
-const REASONING_EFFORT_FIELD = z.union(QODER_REASONING_EFFORTS)
+const REASONING_EFFORT_FIELD = z.union(QODER_REASONING_EFFORTS).volatile()
   .description('Reasoning effort (--reasoning-effort); empty uses the CLI default')
 
 /** Thinking-mode selector; same reasoning as the effort field. */
-const THINKING_FIELD = z.union(QODER_THINKING_MODES)
+const THINKING_FIELD = z.union(QODER_THINKING_MODES).volatile()
   .description('Thinking mode (--thinking); empty uses the CLI default')
 
 /** Thinking-token budget; 0 or absent omits `--thinking-budget`. */
-const THINKING_BUDGET_FIELD = z.number()
+const THINKING_BUDGET_FIELD = z.number().volatile()
   .description('Fixed thinking token budget (--thinking-budget); 0 uses the CLI default')
 
 /**
@@ -207,17 +250,36 @@ const THINKING_BUDGET_FIELD = z.number()
  * number is a per-model fact from the official catalog, so persisting one
  * here would freeze a value that goes stale the moment Qoder re-declares it.
  */
-const CONTEXT_WINDOW_MAX_FIELD = z.boolean()
+const CONTEXT_WINDOW_MAX_FIELD = z.boolean().volatile()
   .description('Serve models at the largest context window the official catalog declares (--context-window)')
 
 /**
  * Switched-off model ids. An array rather than a per-model map so the card can
  * write the whole set at once — a batch "hide all" is one request, not N.
  */
-const HIDDEN_MODELS_FIELD = z.array(z.string())
+const HIDDEN_MODELS_FIELD = z.array(z.string()).volatile()
   .description('Model ids to hide from the model picker')
 
-export const Config: z<Config> = z.object({
+/**
+ * The plugin schema.
+ *
+ * Every field is `volatile()`, which is what lets the card save without DSH
+ * tearing the plugin down: an ordinary config change remounts the entry
+ * (losing the loopback shim, the catalog and the readiness sweep), while a
+ * volatile-only change is committed in place by the loader.
+ *
+ * The price is that `apply()` receives these fields wrapped in `Volatile`
+ * refs rather than as plain values — see {@link readConfig} and
+ * {@link AppliedConfig}.
+ *
+ * Deliberately left without a type annotation: schemastery's `z<T>` constrains
+ * a schema's input and output to the same `T`, and here they differ — the
+ * profile document holds plain values while validation returns refs. The
+ * inferred type is the honest one; the logical shape lives in the `Config`
+ * interface, which is what every consumer of this module actually annotates
+ * against.
+ */
+export const Config = z.object({
   cli: CLI_FIELD,
   reasoningEffort: REASONING_EFFORT_FIELD,
   thinking: THINKING_FIELD,
@@ -226,15 +288,40 @@ export const Config: z<Config> = z.object({
   hiddenModels: HIDDEN_MODELS_FIELD,
 })
 
-/** The settings section: only the fields the card edits. */
-const SECTION: z<Config> = z.object({
-  cli: CLI_FIELD,
-  reasoningEffort: REASONING_EFFORT_FIELD,
-  thinking: THINKING_FIELD,
-  thinkingBudget: THINKING_BUDGET_FIELD,
-  contextWindowMax: CONTEXT_WINDOW_MAX_FIELD,
-  hiddenModels: HIDDEN_MODELS_FIELD,
-})
+/**
+ * Read one config field, unwrapping a `Volatile` ref when there is one.
+ *
+ * The shape check rather than a version check on purpose: a host running an
+ * older schemastery hands the field through as a plain value, and this plugin
+ * still has to work there. Only a `get` method is treated as a ref, so a
+ * string, a number, a boolean and an array all pass through untouched.
+ */
+function readField<T>(value: T | VolatileRef | undefined): T | undefined {
+  if (value === undefined) return undefined
+  const candidate = value as { get?: unknown }
+  if (typeof candidate.get === 'function') return (value as VolatileRef).get() as T
+  return value as T
+}
+
+/**
+ * Read the live config, with volatile refs resolved to their current values.
+ *
+ * Every consumer of the plugin's settings goes through here. Reading a ref
+ * each time is what makes an edit on the card visible to the next chat run
+ * without a restart: the loader swaps the ref's contents in place and emits
+ * `loader/volatile-update`, so a snapshot taken once at startup would freeze
+ * the value this function exists to keep current.
+ */
+function readConfig(config: AppliedConfig): Config {
+  return {
+    cli: readField(config.cli),
+    reasoningEffort: readField(config.reasoningEffort),
+    thinking: readField(config.thinking),
+    thinkingBudget: readField(config.thinkingBudget),
+    contextWindowMax: readField(config.contextWindowMax),
+    hiddenModels: readField(config.hiddenModels),
+  }
+}
 
 /**
  * Resolve the explicit `--context-window` for one CLI model name.
@@ -281,7 +368,7 @@ function qoderOptionsFor(config: Config, resolveContextWindow?: (cliModel: strin
  *
  * @returns whether the provider registered.
  */
-async function start(ctx: Context, config: Config): Promise<boolean> {
+async function start(ctx: Context, config: AppliedConfig): Promise<boolean> {
   // The shim reads the qoder options through a thunk, so a setting edited on
   // the card reaches the next chat run without a restart — the previous
   // snapshot-at-startup behaviour meant a reasoning or context-window change
@@ -297,14 +384,21 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
   const catalog = new QoderCatalog()
   // Adopt the persisted switches before anything is served, so a restart does
   // not briefly offer models the user had switched off.
-  if (Array.isArray(config.hiddenModels) && catalog.setHidden(config.hiddenModels)) {
+  const initialHidden = readField(config.hiddenModels)
+  if (Array.isArray(initialHidden) && catalog.setHidden(initialHidden)) {
     // Nothing to publish yet — the adapter is constructed below and reads the
     // catalog through `current()`, which already reflects the hidden set.
   }
-  // Live configuration source: starts as the applied config and is replaced
-  // by the settings section's source once one is installed, so a CLI
-  // override edited in settings reaches the readiness sweep at once.
-  let current = (): Config => config
+  /**
+   * Live configuration source.
+   *
+   * Reads through {@link readConfig} on every call rather than holding a
+   * snapshot, so a volatile edit committed by the loader is visible to the
+   * next chat run without a restart. This replaces the section-source
+   * indirection the removed `installSection` API provided: there is no
+   * separate source to swap in, the applied config *is* the live one.
+   */
+  const current = (): Config => readConfig(config)
   let releaseAdapter: (() => void) | undefined
   let releaseDirectory: (() => void) | undefined
   let sweep: () => void = () => {}
@@ -499,6 +593,33 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
     await refreshAll()
   })()
 
+  /**
+   * React to a save made on the card.
+   *
+   * Invoked by the config route once the host has accepted a write, which is
+   * the plugin's own notification path — the loader does emit
+   * `loader/volatile-update` afterwards, but that name is internal to the
+   * loader package and is not part of the typed event surface, so relying on
+   * it would couple this plugin to an implementation detail.
+   *
+   * The sweep's timer would eventually re-check readiness, but a
+   * context-window switch or a model toggle changes what the picker serves
+   * and has to republish the adapter snapshot at once, or the picker keeps
+   * showing the window and roster that were in effect before the save.
+   *
+   * Declared before the route that calls it: the route is registered from an
+   * `inject` callback whose body only runs later, but a `const` in the same
+   * scope is still in its temporal dead zone until this line executes.
+   */
+  const onSettingsChanged = (): void => {
+    // The CLI override changed: drop the cached resolution so the new command
+    // is probed, then re-check readiness.
+    clearQoderCliCache()
+    if (catalog.setHidden(current().hiddenModels ?? [])) invalidate()
+    invalidate()
+    sweep()
+  }
+
   // Same-origin routes backing the Plugin-configuration card: the status
   // read, plus the write route for the reasoning controls. The webServer
   // service is optional (a headless profile serves no browser).
@@ -512,30 +633,25 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
       settings: async () => webCtx.get('settings'),
       refreshModels: refreshAll,
       factsCount: () => modelFacts.size,
+      onSettingsChanged,
       get qoder() { return qoderOptionsFor(current()) },
     }
     registerQoderRoutes(webCtx, deps)
   })
 
-  // The settings section is what makes the namespace "served" — which is
-  // how both the Plugins tab (card dispatch) and the Models settings page
-  // (provider directory join) find this plugin. Without one the plugin
-  // still serves its models; it simply has no user-editable section.
+  // Register the settings page policy. This plugin brings its own card
+  // (registered into the `plugins.item` slot by the browser half), so it must
+  // opt out of the host's auto-generated page; without this the namespace
+  // resolves but DSH renders a default form beside the real card.
+  //
+  // `installSection` — the API that used to both declare the section and hand
+  // back a live config source — was removed in DSH 0.1.7, so there is no
+  // section schema to pass and no source to adopt: the volatile fields on
+  // `Config` are what the host reads, and `readConfig` is what this plugin
+  // reads. The owner is the plugin's own fiber rather than the inject scope's,
+  // because the policy is keyed by the entry's fiber.
   ctx.inject(['settings'], settingsCtx => {
-    settingsCtx.settings.installSection(ctx, QODER_SETTINGS_NS, SECTION, config, {
-      setSource(source) { current = source as () => Config },
-      onChange: () => {
-        // The CLI override changed: drop the cached resolution so the new
-        // command is probed, then re-check readiness at once.
-        clearQoderCliCache()
-        // A context-window switch or a model toggle changes what the picker
-        // serves, so the snapshot has to be republished — otherwise it keeps
-        // showing the window and the roster that were in effect before.
-        if (catalog.setHidden(current().hiddenModels ?? [])) invalidate()
-        invalidate()
-        sweep()
-      },
-    })
+    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber), 'dsh-qoder-connect: settings page policy')
   })
 
   ctx.effect(() => () => {
@@ -545,7 +661,7 @@ async function start(ctx: Context, config: Config): Promise<boolean> {
   return true
 }
 
-export function apply(ctx: Context, config: Config): void {
+export function apply(ctx: Context, config: AppliedConfig): void {
   void start(ctx, config).then(registered => {
     if (!registered) {
       ctx.logger.warn('dsh-qoder-connect: the qoder provider is unavailable in this profile')

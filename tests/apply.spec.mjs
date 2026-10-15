@@ -7,12 +7,34 @@
  * booting DSH. Machine-independent: the assertions hold whether or not the
  * test machine has a Qoder login (the sweep's outcome is observed, not
  * assumed).
+ *
+ * One caveat that is NOT machine-independent: `apply()` starts the plugin for
+ * real, which means the startup roster refresh resolves the actual `qoderclicn`
+ * and — since the refresh persists what it fetched — writes a roster file. The
+ * redirect below sends that write to a throwaway directory; without it the
+ * suite would overwrite the developer's own `$DSH_HOME/qoder-connect/roster.json`
+ * with whatever this machine's CLI happened to answer.
  */
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { EventEmitter } from 'node:events'
-import { apply, QODER_MODELS, QODER_PROVIDER, QODER_SETTINGS_NS } from '../lib/index.js'
+import {
+  apply,
+  loadQoderRoster,
+  qoderRosterPath,
+  saveQoderRoster,
+  QODER_MODELS,
+  QODER_PROVIDER,
+  QODER_SETTINGS_NS,
+} from '../lib/index.js'
+
+/** Redirect the dsh home for this whole test file. See the module comment. */
+const TEST_DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-qoder-apply-home-'))
+process.env.DSH_HOME = TEST_DSH_HOME
 
 /** A mock Cordis context recording everything the plugin registers. */
 function mockContext(overrides = {}) {
@@ -110,6 +132,40 @@ test('apply registers the qoder route and its directory entry', async () => {
   }
 })
 
+test('the startup roster refresh resolves its cache under the redirected home', async () => {
+  // The regression this guards: `apply()` boots the plugin for real, so the
+  // startup refresh resolves the actual `qoderclicn` and persists whatever it
+  // answers. Before the redirect at the top of this file that write landed in
+  // the developer's own `$DSH_HOME/qoder-connect/roster.json`, replacing a
+  // real account's roster with a test machine's answer.
+  //
+  // The assertion is on where the path resolves, not on whether a file
+  // appeared: a DSH running concurrently on the same machine legitimately
+  // writes that same file, so "the real home is untouched" would be a claim
+  // about the developer's other processes rather than about this one. Proving
+  // the resolution is both deterministic and complete — `saveQoderRoster` can
+  // only write where `qoderRosterPath` points.
+  assert.ok(
+    qoderRosterPath().startsWith(TEST_DSH_HOME),
+    `expected the roster cache under ${TEST_DSH_HOME}, got ${qoderRosterPath()}`,
+  )
+
+  // And the writer really does follow it. This runs in its own home so the
+  // one-model roster it writes cannot reach the other tests in this file,
+  // which adopt whatever the shared home holds on their next `apply()`.
+  const own = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-qoder-apply-isolated-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = own
+  try {
+    await saveQoderRoster([{ id: 'qoder-auto', name: 'Auto' }])
+    assert.equal(fs.existsSync(qoderRosterPath()), true)
+    assert.deepEqual((await loadQoderRoster())?.models, [{ id: 'qoder-auto', name: 'Auto' }])
+  } finally {
+    process.env.DSH_HOME = previous
+    fs.rmSync(own, { recursive: true, force: true })
+  }
+})
+
 test('the adapter serves models through the pi-ai profile', async () => {
   const { ctx, calls, disposeAll } = mockContext()
   try {
@@ -192,28 +248,58 @@ test('the web-status route answers a loopback GET with a status document', async
   }
 })
 
-test('the settings section installs under the qoder namespace', async () => {
-  const sections = []
+test('the settings page policy opts out of the auto-generated page', async () => {
+  // Replaces the old `installSection` assertion. The card is registered by the
+  // browser half into the `plugins.item` slot, so the host must be told not to
+  // synthesize a page of its own — otherwise the namespace resolves and DSH
+  // renders a default form beside the real card.
+  //
+  // The owner matters as much as the flag: the host keys the policy by the
+  // plugin entry's fiber, so passing the inject scope's fiber (the default)
+  // would register a policy the host never looks up.
+  const policies = []
   const { ctx, disposeAll } = mockContext({
     inject(services, callback) {
       if (services.includes('settings')) {
+        const scopeEffects = []
         callback({
+          effect(fn) {
+            const dispose = fn()
+            scopeEffects.push(dispose)
+            return () => { if (typeof dispose === 'function') dispose() }
+          },
           settings: {
-            installSection(owner, ns, schema, config, options) {
-              sections.push({ ns, schema, config, options })
+            configure(presentation, owner) {
+              policies.push({ presentation, owner })
+              return () => {}
             },
-            async update() {},
           },
         })
+        for (const dispose of scopeEffects) if (typeof dispose === 'function') dispose()
       }
       return () => {}
     },
   })
   try {
     apply(ctx, { cli: 'qoderclicn' })
-    assert.ok(await waitFor(() => sections.length === 1))
-    assert.equal(sections[0].ns, QODER_SETTINGS_NS)
-    assert.deepEqual(sections[0].config, { cli: 'qoderclicn' })
+    assert.ok(await waitFor(() => policies.length === 1))
+    assert.deepEqual(policies[0].presentation, { auto: false })
+    assert.equal(policies[0].owner, ctx.fiber)
+  } finally {
+    disposeAll()
+  }
+})
+
+test('the provider directory entry joins the settings namespace', async () => {
+  // The Models settings page finds a provider's namespace through this entry,
+  // and the namespace is the profile entry id — not the provider id. Mixing
+  // the two up is what produced `No configurable plugin entry "qoder"`.
+  const { ctx, calls, disposeAll } = mockContext()
+  try {
+    apply(ctx, {})
+    assert.ok(await waitFor(() => calls.providers.length === 1))
+    assert.equal(calls.providers[0][0].settingsNs, QODER_SETTINGS_NS)
+    assert.equal(QODER_SETTINGS_NS, 'dsh-qoder-connect')
   } finally {
     disposeAll()
   }

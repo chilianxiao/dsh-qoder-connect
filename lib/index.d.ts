@@ -2,7 +2,7 @@ import z from "@deepseek-ai/schemastery";
 import { PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
 import { IncomingMessage, ServerResponse } from "node:http";
 import { Context } from "@deepseek-ai/cordis";
-import { SettingsNamespace, SettingsProvider } from "@deepseek-ai/dsh-settings";
+import { SettingsForms, SettingsNamespace } from "@deepseek-ai/dsh-settings";
 import { AttachmentStore } from "@deepseek-ai/dsh-attachment";
 //#region src/qoder.d.ts
 /**
@@ -920,7 +920,7 @@ interface QoderStatusRouteOptions {
    * request time. Absent (headless, or settings not yet attached) simply
    * means the write route answers 501.
    */
-  settings?: () => Promise<SettingsProvider | undefined>;
+  settings?: () => Promise<SettingsForms | undefined>;
   /**
    * The namespace the card's writes target, and the plugin's own namespace.
    * Required for the write route; without it writes are refused.
@@ -938,6 +938,16 @@ interface QoderStatusRouteOptions {
    * and levels actually came from the official catalog or the fallback.
    */
   factsCount?: () => number;
+  /**
+   * Called after the host has accepted a settings write.
+   *
+   * The write commits the volatile refs in place, so the plugin's own live
+   * reads already see the new values by the time this runs; what still needs
+   * doing is republishing the adapter snapshot, because a context-window
+   * switch or a model toggle changes what the picker serves and nothing else
+   * would notice until the next readiness sweep.
+   */
+  onSettingsChanged?: () => void;
 }
 /**
  * The reasoning controls as the card renders them: the live options plus the
@@ -1007,8 +1017,36 @@ declare function registerQoderRoutes(ctx: Context, deps: QoderStatusRouteOptions
 declare const name = "llm-qoder";
 /** The model registry required before the provider can register. */
 declare const inject: string[];
-/** Settings namespace owning the plugin card's section. */
+/**
+ * Settings namespace this plugin's card writes through.
+ *
+ * It is the **profile entry id** — the package name as it appears in the
+ * profile's `dependencies` and `dsh.profile.bundles` — not the model provider
+ * id. DSH's settings service resolves a namespace by matching
+ * `entry.options.id` (`dsh-settings` `SettingsForms.write`), and an entry id
+ * is the bundle's package name, so the two are different keys that happen to
+ * describe the same plugin.
+ *
+ * Getting this wrong is not a silent no-op: the write throws
+ * `No configurable plugin entry "<ns>"`, which surfaces on the card as a
+ * failed save with no hint that the namespace was the problem. The provider
+ * id (`qoder`) is the right answer for `llm.registerAdapter` and the wrong
+ * one here.
+ */
 declare const QODER_SETTINGS_NS: SettingsNamespace;
+/**
+ * A `Volatile` reference as schemastery hands it to a plugin.
+ *
+ * A schema field marked `volatile()` validates to one of these instead of a
+ * plain value, so that the loader can commit an edit in place rather than
+ * remounting the plugin. The getter is typed loosely on purpose: cosmokit's
+ * `Volatile<T>` reports a readonly view of `T`, which does not line up with
+ * the mutable `T` this plugin stores, and the only thing done with the result
+ * is read it.
+ */
+interface VolatileRef {
+  get(): unknown;
+}
 /** Plugin configuration. */
 interface Config {
   /**
@@ -1049,7 +1087,50 @@ interface Config {
    */
   hiddenModels?: string[];
 }
-declare const Config: z<Config>;
-declare function apply(ctx: Context, config: Config): void;
+/**
+ * The config as the host hands it to `apply()`.
+ *
+ * Identical to {@link Config} except that every field may arrive as a
+ * `Volatile` ref rather than a plain value, because each schema field is
+ * marked `volatile()` so the host can commit a card edit in place instead of
+ * remounting the plugin. {@link readConfig} is the one place that resolves
+ * them; everything downstream of it sees plain {@link Config}.
+ */
+type AppliedConfig = { [K in keyof Config]: Config[K] | VolatileRef | undefined; };
+/**
+ * The plugin schema.
+ *
+ * Every field is `volatile()`, which is what lets the card save without DSH
+ * tearing the plugin down: an ordinary config change remounts the entry
+ * (losing the loopback shim, the catalog and the readiness sweep), while a
+ * volatile-only change is committed in place by the loader.
+ *
+ * The price is that `apply()` receives these fields wrapped in `Volatile`
+ * refs rather than as plain values — see {@link readConfig} and
+ * {@link AppliedConfig}.
+ *
+ * Deliberately left without a type annotation: schemastery's `z<T>` constrains
+ * a schema's input and output to the same `T`, and here they differ — the
+ * profile document holds plain values while validation returns refs. The
+ * inferred type is the honest one; the logical shape lives in the `Config`
+ * interface, which is what every consumer of this module actually annotates
+ * against.
+ */
+declare const Config: z<Schemastery.ObjectS<NoInfer<{
+  cli: z<string, string, "volatile">;
+  reasoningEffort: z<"auto" | "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode", "auto" | "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode", "volatile">;
+  thinking: z<"auto" | "adaptive" | "enabled" | "disabled", "auto" | "adaptive" | "enabled" | "disabled", "volatile">;
+  thinkingBudget: z<number, number, "volatile">;
+  contextWindowMax: z<boolean, boolean, "volatile">;
+  hiddenModels: z<NoInfer<string[]>, NoInfer<string[]>, "volatile">;
+}>>, Schemastery.ObjectT<NoInfer<{
+  cli: z<string, string, "volatile">;
+  reasoningEffort: z<"auto" | "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode", "auto" | "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode", "volatile">;
+  thinking: z<"auto" | "adaptive" | "enabled" | "disabled", "auto" | "adaptive" | "enabled" | "disabled", "volatile">;
+  thinkingBudget: z<number, number, "volatile">;
+  contextWindowMax: z<boolean, boolean, "volatile">;
+  hiddenModels: z<NoInfer<string[]>, NoInfer<string[]>, "volatile">;
+}>>, "plain">;
+declare function apply(ctx: Context, config: AppliedConfig): void;
 //#endregion
-export { Config, QODER_CONFIG_PATH, QODER_CONNECT_VERSION, QODER_DEFAULT_MODEL, QODER_MAX_THINKING_BUDGET, QODER_MODELS, QODER_PROVIDER, QODER_REASONING_EFFORTS, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_THINKING_MODES, QODER_TIMEOUT_MS, type QoderAdapter, QoderCatalog, type QoderCatalogEntry, type QoderCatalogSnapshot, type QoderContextWindowMode, type QoderImageMaterial, type QoderLedgerEntry, type QoderModelFacts, type QoderPromotion, type QoderReasoningEffort, type QoderRosterSource, type QoderRunResult, type QoderSavedModel, type QoderSavedRoster, type QoderShim, type QoderStatus, type QoderThinkingMode, type QoderWebContextWindow, type QoderWebReasoning, type QoderWebStatus, aggregateQoderChunks, appendQoderLedgerEntry, apply, buildCliPrompt, buildReasoningArgs, clearQoderCliCache, cliModelFor, createQoderAdapter, createQoderShim, decryptQmcCatalog, disposeImageAttachments, fetchQoderModels, formatQoderPrice, inject, loadQoderModelFacts, loadQoderRoster, materializeImageAttachments, name, parseCatalogDocument, parseCliDelta, parseCliResult, parseListModelsOutput, parseQoderConfigPatch, parseReasoningPatch, qoderChatStream, qoderConfigHandler, qoderExternalId, qoderLedgerPath, qoderOauthUserCandidates, qoderOauthUserPath, qoderRosterPath, qoderStatus, qoderWebContextWindow, qoderWebReasoning, qoderWebStatus, registerQoderRoutes, registerQoderStatusRoute, saveQoderRoster, thinkingLevelMapFor };
+export { AppliedConfig, Config, QODER_CONFIG_PATH, QODER_CONNECT_VERSION, QODER_DEFAULT_MODEL, QODER_MAX_THINKING_BUDGET, QODER_MODELS, QODER_PROVIDER, QODER_REASONING_EFFORTS, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_THINKING_MODES, QODER_TIMEOUT_MS, type QoderAdapter, QoderCatalog, type QoderCatalogEntry, type QoderCatalogSnapshot, type QoderContextWindowMode, type QoderImageMaterial, type QoderLedgerEntry, type QoderModelFacts, type QoderPromotion, type QoderReasoningEffort, type QoderRosterSource, type QoderRunResult, type QoderSavedModel, type QoderSavedRoster, type QoderShim, type QoderStatus, type QoderThinkingMode, type QoderWebContextWindow, type QoderWebReasoning, type QoderWebStatus, aggregateQoderChunks, appendQoderLedgerEntry, apply, buildCliPrompt, buildReasoningArgs, clearQoderCliCache, cliModelFor, createQoderAdapter, createQoderShim, decryptQmcCatalog, disposeImageAttachments, fetchQoderModels, formatQoderPrice, inject, loadQoderModelFacts, loadQoderRoster, materializeImageAttachments, name, parseCatalogDocument, parseCliDelta, parseCliResult, parseListModelsOutput, parseQoderConfigPatch, parseReasoningPatch, qoderChatStream, qoderConfigHandler, qoderExternalId, qoderLedgerPath, qoderOauthUserCandidates, qoderOauthUserPath, qoderRosterPath, qoderStatus, qoderWebContextWindow, qoderWebReasoning, qoderWebStatus, registerQoderRoutes, registerQoderStatusRoute, saveQoderRoster, thinkingLevelMapFor };

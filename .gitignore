@@ -2,3 +2,5 @@ node_modules/
 *.log
 *.bak
 *.bak-*
+# Machine-local pnpm prompt artifact (allowBuilds placeholders), never shared.
+pnpm-workspace.yaml

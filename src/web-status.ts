@@ -10,7 +10,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
+import type { SettingsForms } from '@deepseek-ai/dsh-settings'
 import type { QoderCatalog } from './catalog.ts'
 import {
   qoderStatus,
@@ -36,7 +36,7 @@ export interface QoderStatusRouteOptions {
    * request time. Absent (headless, or settings not yet attached) simply
    * means the write route answers 501.
    */
-  settings?: () => Promise<SettingsProvider | undefined>
+  settings?: () => Promise<SettingsForms | undefined>
   /**
    * The namespace the card's writes target, and the plugin's own namespace.
    * Required for the write route; without it writes are refused.
@@ -54,6 +54,16 @@ export interface QoderStatusRouteOptions {
    * and levels actually came from the official catalog or the fallback.
    */
   factsCount?: () => number
+  /**
+   * Called after the host has accepted a settings write.
+   *
+   * The write commits the volatile refs in place, so the plugin's own live
+   * reads already see the new values by the time this runs; what still needs
+   * doing is republishing the adapter snapshot, because a context-window
+   * switch or a model toggle changes what the picker serves and nothing else
+   * would notice until the next readiness sweep.
+   */
+  onSettingsChanged?: () => void
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {
@@ -352,7 +362,11 @@ export function qoderConfigHandler(
       // persisting a value the schema would reject.
       const ops = Object.entries(parsed.patch).map(([key, value]) =>
         value === '' ? { op: 'unset' as const, path: [key] } : { op: 'set' as const, path: [key], value })
-      await provider.mutate(ns as Parameters<SettingsProvider['mutate']>[0], ops)
+      await provider.mutate(ns, ops)
+      // The host has committed the volatile refs, so the plugin's live reads
+      // already answer with the new values; this only republishes the snapshot
+      // the picker is showing.
+      deps.onSettingsChanged?.()
       json(res, 200, { ok: true, reasoning: qoderWebReasoning(deps.qoder) })
     } catch (error: unknown) {
       json(res, 400, { error: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300) })
